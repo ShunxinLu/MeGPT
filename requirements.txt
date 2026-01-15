@@ -1,0 +1,32 @@
+# Local Memory Agent - Python Dependencies
+# =========================================
+
+# LangChain & LangGraph
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# Memory (Mem0)
+mem0ai>=0.1.0
+
+# Vector Store
+qdrant-client>=1.9.0
+
+# Web Search (Privacy-first, no API key)
+duckduckgo-search>=6.0.0
+
+# Configuration
+python-dotenv>=1.0.0
+
+# CLI
+rich>=13.0.0
+
+# API Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0.0
+sse-starlette>=2.0.0
+
+# LM Studio SDK (for auto-loading models)
+lmstudio>=1.5.0
