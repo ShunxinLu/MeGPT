@@ -1,54 +1,88 @@
 """
-Memory Tool - Mem0 integration for persistent long-term memory.
-Uses local embeddings to maintain privacy.
+Memory Tool - Direct Qdrant integration for persistent long-term memory.
+Uses local embeddings via LM Studio's embedding endpoint.
+Bypasses Mem0's LLM-based extraction which doesn't work with local models.
 """
-from mem0 import Memory
+import uuid
+import json
+from datetime import datetime
+from typing import Optional
+import httpx
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import (
+    VectorParams, Distance, PointStruct, 
+    Filter, FieldCondition, MatchValue
+)
+
 from config import config
 
-# Mem0 configuration with explicit local embedder
-# CRITICAL: This ensures embeddings don't call OpenAI cloud
-_mem0_config = {
-    "vector_store": {
-        "provider": "qdrant",
-        "config": {
-            "host": config.qdrant_host,
-            "port": config.qdrant_port,
-        }
-    },
-    "llm": {
-        "provider": "openai",
-        "config": {
-            "model": config.llm_model_name,
-            "openai_base_url": config.llm_base_url,
-            "openai_api_key": config.llm_api_key,
-        }
-    },
-    # CRITICAL: Define embedder explicitly to avoid default OpenAI calls
-    "embedder": {
-        "provider": "openai",
-        "config": {
-            "model": config.embedder_model_name,
-            "openai_base_url": config.embedder_base_url,
-            "openai_api_key": config.embedder_api_key,
-        }
-    }
-}
+# Constants
+COLLECTION_NAME = "megpt_memories"
+EMBEDDING_DIM = 768  # nomic-embed-text dimension
 
-# Lazy initialization of memory client
-_memory_client: Memory | None = None
+# Lazy initialization
+_qdrant_client: Optional[QdrantClient] = None
 
 
-def get_memory_client() -> Memory | None:
-    """Get or create the Mem0 memory client (singleton pattern)."""
-    global _memory_client
-    if _memory_client is None:
+def get_qdrant_client() -> Optional[QdrantClient]:
+    """Get or create the Qdrant client (singleton pattern)."""
+    global _qdrant_client
+    if _qdrant_client is None:
         try:
-            _memory_client = Memory.from_config(_mem0_config)
-            print("✓ Mem0 initialized with local embeddings")
+            _qdrant_client = QdrantClient(
+                host=config.qdrant_host,
+                port=config.qdrant_port,
+            )
+            # Ensure collection exists
+            _ensure_collection()
+            print("✓ Qdrant memory store initialized")
         except Exception as e:
-            print(f"⚠ Mem0 initialization failed: {e}")
+            print(f"⚠ Qdrant initialization failed: {e}")
             return None
-    return _memory_client
+    return _qdrant_client
+
+
+def _ensure_collection():
+    """Create the collection if it doesn't exist."""
+    client = _qdrant_client
+    if client is None:
+        return
+    
+    try:
+        collections = client.get_collections().collections
+        exists = any(c.name == COLLECTION_NAME for c in collections)
+        
+        if not exists:
+            client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=VectorParams(
+                    size=EMBEDDING_DIM,
+                    distance=Distance.COSINE,
+                ),
+            )
+            print(f"✓ Created collection: {COLLECTION_NAME}")
+    except Exception as e:
+        print(f"⚠ Collection check/create failed: {e}")
+
+
+def _get_embedding(text: str) -> Optional[list[float]]:
+    """Get embedding from local LM Studio embedding endpoint."""
+    try:
+        response = httpx.post(
+            f"{config.embedder_base_url}/embeddings",
+            json={
+                "model": config.embedder_model_name,
+                "input": text,
+            },
+            headers={"Authorization": f"Bearer {config.embedder_api_key}"},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["data"][0]["embedding"]
+    except Exception as e:
+        print(f"⚠ Embedding failed: {e}")
+        return None
 
 
 def retrieve_context(query: str, user_id: str | None = None) -> str:
@@ -63,32 +97,61 @@ def retrieve_context(query: str, user_id: str | None = None) -> str:
         Formatted string of relevant memories, or empty if none found
     """
     user_id = user_id or config.user_id
-    memory = get_memory_client()
+    client = get_qdrant_client()
+    
+    if client is None:
+        print("⚠ Memory client not available, skipping recall")
+        return ""
     
     try:
-        results = memory.search(query, user_id=user_id, limit=5)
+        print(f"🔍 Searching memories for user {user_id}...")
         
-        if not results or not results.get("results"):
+        # Get query embedding
+        query_embedding = _get_embedding(query)
+        if query_embedding is None:
+            return ""
+        
+        # Search in Qdrant using query_points (newer API)
+        from qdrant_client.http.models import QueryRequest
+        results = client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=query_embedding,
+            query_filter=Filter(
+                must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+            ),
+            limit=5,
+            with_payload=True,
+        )
+        
+        if not results or not results.points:
+            print("  No memories found")
             return ""
         
         # Format memories as context
         memories = []
-        for item in results["results"]:
-            if "memory" in item:
-                memories.append(f"- {item['memory']}")
+        for hit in results.points:
+            if hit.score and hit.score > 0.5:  # Only include relevant memories
+                memories.append(f"- {hit.payload.get('memory', '')}")
         
         if memories:
+            print(f"  Found {len(memories)} memories")
             return "Here is what you remember about this user:\n" + "\n".join(memories)
+        
+        print("  No relevant memories found")
         return ""
     except Exception as e:
         print(f"⚠ Memory search failed: {e}")
         return ""
 
 
-def save_interaction(user_input: str, ai_response: str, user_id: str | None = None, chat_id: str | None = None) -> None:
+def save_interaction(
+    user_input: str, 
+    ai_response: str, 
+    user_id: str | None = None, 
+    chat_id: str | None = None
+) -> None:
     """
     Save the interaction to memory for future recall.
-    Combines user input and AI response for context.
     
     Args:
         user_input: The user's message
@@ -97,13 +160,39 @@ def save_interaction(user_input: str, ai_response: str, user_id: str | None = No
         chat_id: Optional chat ID for cascading delete
     """
     user_id = user_id or config.user_id
-    memory = get_memory_client()
+    client = get_qdrant_client()
+    
+    if client is None:
+        print("⚠ Memory client not available, skipping save")
+        return
     
     try:
-        # Save the interaction as a memory with chat_id metadata
-        interaction = f"User said: {user_input}\nAssistant responded: {ai_response}"
-        metadata = {"chat_id": chat_id} if chat_id else {}
-        memory.add(interaction, user_id=user_id, metadata=metadata)
+        # Create memory text (we save the key user info)
+        memory_text = f"User said: {user_input}\nAssistant responded: {ai_response}"
+        
+        # Get embedding
+        embedding = _get_embedding(memory_text)
+        if embedding is None:
+            return
+        
+        # Create point
+        point_id = str(uuid.uuid4())
+        point = PointStruct(
+            id=point_id,
+            vector=embedding,
+            payload={
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "memory": memory_text,
+                "user_input": user_input,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+        )
+        
+        print(f"💾 Saving memory for user {user_id}...")
+        client.upsert(collection_name=COLLECTION_NAME, points=[point])
+        print(f"✓ Memory saved: {point_id}")
+        
     except Exception as e:
         print(f"⚠ Memory save failed: {e}")
 
@@ -117,10 +206,29 @@ def add_memory(fact: str, user_id: str | None = None) -> None:
         user_id: Optional user identifier
     """
     user_id = user_id or config.user_id
-    memory = get_memory_client()
+    client = get_qdrant_client()
+    
+    if client is None:
+        return
     
     try:
-        memory.add(fact, user_id=user_id)
+        embedding = _get_embedding(fact)
+        if embedding is None:
+            return
+        
+        point_id = str(uuid.uuid4())
+        point = PointStruct(
+            id=point_id,
+            vector=embedding,
+            payload={
+                "user_id": user_id,
+                "memory": fact,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+        )
+        
+        client.upsert(collection_name=COLLECTION_NAME, points=[point])
+        print(f"✓ Added memory: {fact[:50]}...")
     except Exception as e:
         print(f"⚠ Memory add failed: {e}")
 
@@ -133,17 +241,38 @@ def get_all_memories(user_id: str | None = None) -> list[dict]:
         user_id: Optional user identifier
     
     Returns:
-        List of memory dictionaries with id, memory, created_at
+        List of memory dictionaries
     """
     user_id = user_id or config.user_id
-    memory = get_memory_client()
+    client = get_qdrant_client()
     
-    if memory is None:
+    if client is None:
         return []
     
     try:
-        results = memory.get_all(user_id=user_id)
-        return results.get("results", []) if results else []
+        # Scroll through all points for this user
+        results, _ = client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=Filter(
+                must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+            ),
+            limit=100,
+            with_payload=True,
+        )
+        
+        memories = []
+        for point in results:
+            memories.append({
+                "id": str(point.id),
+                "memory": point.payload.get("memory", ""),
+                "created_at": point.payload.get("created_at"),
+                "metadata": {
+                    "chat_id": point.payload.get("chat_id"),
+                    "user_input": point.payload.get("user_input"),
+                }
+            })
+        
+        return memories
     except Exception as e:
         print(f"⚠ Memory get_all failed: {e}")
         return []
@@ -159,10 +288,16 @@ def delete_memory(memory_id: str) -> bool:
     Returns:
         True if deleted successfully
     """
-    memory = get_memory_client()
+    client = get_qdrant_client()
+    
+    if client is None:
+        return False
     
     try:
-        memory.delete(memory_id)
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=[memory_id],
+        )
         return True
     except Exception as e:
         print(f"⚠ Memory delete failed: {e}")
@@ -172,7 +307,6 @@ def delete_memory(memory_id: str) -> bool:
 def delete_memories_for_chat(chat_id: str, user_id: str | None = None) -> int:
     """
     Delete all memories associated with a specific chat.
-    Uses metadata filtering if available, otherwise searches and deletes.
     
     Args:
         chat_id: The chat ID whose memories should be deleted
@@ -182,26 +316,36 @@ def delete_memories_for_chat(chat_id: str, user_id: str | None = None) -> int:
         Number of memories deleted
     """
     user_id = user_id or config.user_id
-    memory = get_memory_client()
-    deleted_count = 0
+    client = get_qdrant_client()
+    
+    if client is None:
+        return 0
     
     try:
-        # Get all memories and filter by chat_id in metadata
-        all_memories = memory.get_all(user_id=user_id)
-        if not all_memories or not all_memories.get("results"):
+        # Get all memories for this chat
+        results, _ = client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    FieldCondition(key="chat_id", match=MatchValue(value=chat_id)),
+                ]
+            ),
+            limit=100,
+            with_payload=False,
+        )
+        
+        if not results:
             return 0
         
-        for mem in all_memories["results"]:
-            metadata = mem.get("metadata", {})
-            if metadata.get("chat_id") == chat_id:
-                try:
-                    memory.delete(mem["id"])
-                    deleted_count += 1
-                except Exception:
-                    pass
+        # Delete all matching points
+        point_ids = [str(point.id) for point in results]
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=point_ids,
+        )
         
-        return deleted_count
+        return len(point_ids)
     except Exception as e:
         print(f"⚠ Cascading memory delete failed: {e}")
-        return deleted_count
-
+        return 0
