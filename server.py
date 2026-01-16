@@ -95,14 +95,26 @@ Important facts about yourself:
 - You DO have long-term memory that persists across conversations
 - You remember important facts about the user
 - You can learn new information and recall it later
-- You can search the web when you need current information
+- You CAN search the web for current information
+
+TOOL USAGE:
+When you need to search the web for current/real-time information (stock prices, news, weather, etc.), output EXACTLY this format on its own line:
+[[SEARCH: your search query here]]
+
+After outputting the search command, STOP and wait. The system will execute the search and provide results.
+
+Example:
+User: What's the current price of Bitcoin?
+Assistant: I'll search for the current Bitcoin price.
+[[SEARCH: Bitcoin price today USD]]
 
 Guidelines:
 - Be conversational and helpful
 - When asked about your memory, confirm that you DO remember things
 - Use the information from your memory to personalize responses
 - Format code blocks with proper syntax highlighting using ```language
-- Be concise but thorough"""
+- Be concise but thorough
+- ACTUALLY use the search tool when asked about current events - don't make up data!"""
 
 
 # ========== Helpers ==========
@@ -175,56 +187,63 @@ async def stream_response(
     # Stream: Generating status
     yield format_event("status", "💭 Thinking...")
     
-    # Get streaming LLM with tools bound
+    # Get streaming LLM (no bind_tools - using prompt-based tool calling)
+    import re
     from tools.web_search import web_search
     llm = get_llm(streaming=True)
-    tools = [web_search]
-    llm_with_tools = llm.bind_tools(tools)
     
     full_response = ""
-    max_tool_iterations = 3  # Prevent infinite loops
+    search_pattern = re.compile(r'\[\[SEARCH:\s*(.+?)\]\]', re.IGNORECASE)
+    max_tool_iterations = 3
     
     try:
         for iteration in range(max_tool_iterations):
-            # First, get the LLM response (non-streaming to check for tool calls)
-            response = await llm_with_tools.ainvoke(langchain_messages)
+            # Stream the response
+            buffer = ""
+            found_search = False
             
-            # Check if LLM wants to call a tool
-            if hasattr(response, "tool_calls") and response.tool_calls:
-                for tool_call in response.tool_calls:
-                    tool_name = tool_call.get("name", "")
-                    tool_args = tool_call.get("args", {})
-                    
-                    if tool_name == "web_search":
-                        yield format_event("status", f"🔍 Searching the web...")
-                        
-                        # Execute the web search
-                        query = tool_args.get("query", "")
-                        search_result = web_search.invoke(query)
-                        
-                        yield format_event("status", "📄 Processing search results...")
-                        
-                        # Add tool result to messages and continue
-                        from langchain_core.messages import ToolMessage
-                        langchain_messages.append(response)
-                        langchain_messages.append(ToolMessage(
-                            content=search_result,
-                            tool_call_id=tool_call.get("id", ""),
-                        ))
-                # Continue to next iteration to get final response
-                continue
-            
-            # No tool calls - stream the final response
-            yield format_event("status", "💭 Thinking...")
-            
-            # Stream the actual response content
             async for chunk in llm.astream(langchain_messages):
                 if hasattr(chunk, "content") and chunk.content:
                     content = chunk.content
-                    full_response += content
-                    yield format_event("text", content)
+                    buffer += content
+                    
+                    # Check if we have a complete search command
+                    match = search_pattern.search(buffer)
+                    if match:
+                        # Found a search command!
+                        found_search = True
+                        query = match.group(1).strip()
+                        
+                        # Send text before the search command
+                        before_search = buffer[:match.start()]
+                        if before_search:
+                            full_response += before_search
+                            yield format_event("text", before_search)
+                        
+                        print(f"🔍 Detected search command: {query}")
+                        yield format_event("status", f"🔍 Searching: {query}...")
+                        
+                        # Execute the search
+                        search_result = web_search.invoke(query)
+                        print(f"🔍 Got {len(search_result)} chars of results")
+                        
+                        yield format_event("status", "📄 Processing results...")
+                        
+                        # Add the search result to messages and continue
+                        from langchain_core.messages import AIMessage
+                        langchain_messages.append(AIMessage(content=before_search + f"\n[Searched: {query}]"))
+                        langchain_messages.append(SystemMessage(content=f"SEARCH RESULTS for '{query}':\n\n{search_result}\n\nNow provide a helpful response using these search results. Do NOT use [[SEARCH:]] again."))
+                        
+                        break  # Break inner loop to restart with new context
+                    
+                    # Only yield if we haven't found a search yet
+                    if not found_search and "[[SEARCH" not in buffer:
+                        full_response += content
+                        yield format_event("text", content)
             
-            break  # Exit loop after streaming response
+            if not found_search:
+                # No search found, we're done
+                break
         
         # Save to memory after completion
         if full_response and last_user_input:
@@ -234,14 +253,13 @@ async def stream_response(
                 pass
         
         # ========== PHASE 3: Trigger Background Summary ==========
-        # Every 5th message, update the rolling summary
         if chat_id and background_tasks:
             try:
                 msg_count = get_message_count(chat_id)
                 if msg_count > 0 and msg_count % 5 == 0:
                     background_tasks.add_task(summarize_chat_background, chat_id)
-                    print(f"📝 Scheduled background summary for chat {chat_id[:8]}...")
             except Exception:
+                pass
                 pass
         
     except Exception as e:
