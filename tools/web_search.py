@@ -1,8 +1,8 @@
 """
-Web Search Tool - DuckDuckGo wrapper for privacy-first web searches.
+Web Search Tool - Uses ddgs (DuckDuckGo Search) for privacy-first web searches.
 No API key required.
 """
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from langchain_core.tools import tool
 from config import config
 
@@ -23,8 +23,12 @@ def web_search(query: str) -> str:
         return "Web search is disabled."
     
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=5))
+        ddgs = DDGS()
+        results = list(ddgs.text(query, max_results=5))
+        
+        if not results:
+            # Fallback: try news search
+            results = list(ddgs.news(query, max_results=5))
         
         if not results:
             return f"No results found for: {query}"
@@ -33,8 +37,8 @@ def web_search(query: str) -> str:
         formatted = []
         for i, result in enumerate(results, 1):
             title = result.get("title", "No title")
-            snippet = result.get("body", "No description")
-            url = result.get("href", "")
+            snippet = result.get("body", result.get("excerpt", "No description"))
+            url = result.get("href", result.get("url", ""))
             formatted.append(f"{i}. **{title}**\n   {snippet}\n   Source: {url}")
         
         return "\n\n".join(formatted)
@@ -56,8 +60,8 @@ def search_web_sync(query: str) -> list[dict]:
         return []
     
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=5))
+        ddgs = DDGS()
+        results = list(ddgs.text(query, max_results=5))
         return results
     except Exception as e:
         print(f"⚠ Web search failed: {e}")

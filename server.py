@@ -175,16 +175,56 @@ async def stream_response(
     # Stream: Generating status
     yield format_event("status", "💭 Thinking...")
     
-    # Get streaming LLM
+    # Get streaming LLM with tools bound
+    from tools.web_search import web_search
     llm = get_llm(streaming=True)
+    tools = [web_search]
+    llm_with_tools = llm.bind_tools(tools)
+    
     full_response = ""
+    max_tool_iterations = 3  # Prevent infinite loops
     
     try:
-        async for chunk in llm.astream(langchain_messages):
-            if hasattr(chunk, "content") and chunk.content:
-                content = chunk.content
-                full_response += content
-                yield format_event("text", content)
+        for iteration in range(max_tool_iterations):
+            # First, get the LLM response (non-streaming to check for tool calls)
+            response = await llm_with_tools.ainvoke(langchain_messages)
+            
+            # Check if LLM wants to call a tool
+            if hasattr(response, "tool_calls") and response.tool_calls:
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call.get("name", "")
+                    tool_args = tool_call.get("args", {})
+                    
+                    if tool_name == "web_search":
+                        yield format_event("status", f"🔍 Searching the web...")
+                        
+                        # Execute the web search
+                        query = tool_args.get("query", "")
+                        search_result = web_search.invoke(query)
+                        
+                        yield format_event("status", "📄 Processing search results...")
+                        
+                        # Add tool result to messages and continue
+                        from langchain_core.messages import ToolMessage
+                        langchain_messages.append(response)
+                        langchain_messages.append(ToolMessage(
+                            content=search_result,
+                            tool_call_id=tool_call.get("id", ""),
+                        ))
+                # Continue to next iteration to get final response
+                continue
+            
+            # No tool calls - stream the final response
+            yield format_event("status", "💭 Thinking...")
+            
+            # Stream the actual response content
+            async for chunk in llm.astream(langchain_messages):
+                if hasattr(chunk, "content") and chunk.content:
+                    content = chunk.content
+                    full_response += content
+                    yield format_event("text", content)
+            
+            break  # Exit loop after streaming response
         
         # Save to memory after completion
         if full_response and last_user_input:
