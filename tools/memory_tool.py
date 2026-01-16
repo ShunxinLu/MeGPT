@@ -1,7 +1,7 @@
 """
 Memory Tool - Direct Qdrant integration for persistent long-term memory.
 Uses local embeddings via LM Studio's embedding endpoint.
-Bypasses Mem0's LLM-based extraction which doesn't work with local models.
+Phase 4: Environment-aware collection names.
 """
 import uuid
 import json
@@ -16,8 +16,7 @@ from qdrant_client.http.models import (
 
 from config import config
 
-# Constants
-COLLECTION_NAME = "megpt_memories"
+# Constants - Phase 4: Use config for environment-aware collection
 EMBEDDING_DIM = 768  # nomic-embed-text dimension
 
 # Lazy initialization
@@ -50,17 +49,17 @@ def _ensure_collection():
     
     try:
         collections = client.get_collections().collections
-        exists = any(c.name == COLLECTION_NAME for c in collections)
+        exists = any(c.name == config.qdrant_collection for c in collections)
         
         if not exists:
             client.create_collection(
-                collection_name=COLLECTION_NAME,
+                collection_name=config.qdrant_collection,
                 vectors_config=VectorParams(
                     size=EMBEDDING_DIM,
                     distance=Distance.COSINE,
                 ),
             )
-            print(f"✓ Created collection: {COLLECTION_NAME}")
+            print(f"✓ Created collection: {config.qdrant_collection}")
     except Exception as e:
         print(f"⚠ Collection check/create failed: {e}")
 
@@ -114,7 +113,7 @@ def retrieve_context(query: str, user_id: str | None = None) -> str:
         # Search in Qdrant using query_points (newer API)
         from qdrant_client.http.models import QueryRequest
         results = client.query_points(
-            collection_name=COLLECTION_NAME,
+            collection_name=config.qdrant_collection,
             query=query_embedding,
             query_filter=Filter(
                 must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
@@ -190,7 +189,7 @@ def save_interaction(
         )
         
         print(f"💾 Saving memory for user {user_id}...")
-        client.upsert(collection_name=COLLECTION_NAME, points=[point])
+        client.upsert(collection_name=config.qdrant_collection, points=[point])
         print(f"✓ Memory saved: {point_id}")
         
     except Exception as e:
@@ -227,7 +226,7 @@ def add_memory(fact: str, user_id: str | None = None) -> None:
             }
         )
         
-        client.upsert(collection_name=COLLECTION_NAME, points=[point])
+        client.upsert(collection_name=config.qdrant_collection, points=[point])
         print(f"✓ Added memory: {fact[:50]}...")
     except Exception as e:
         print(f"⚠ Memory add failed: {e}")
@@ -252,7 +251,7 @@ def get_all_memories(user_id: str | None = None) -> list[dict]:
     try:
         # Scroll through all points for this user
         results, _ = client.scroll(
-            collection_name=COLLECTION_NAME,
+            collection_name=config.qdrant_collection,
             scroll_filter=Filter(
                 must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
             ),
@@ -295,7 +294,7 @@ def delete_memory(memory_id: str) -> bool:
     
     try:
         client.delete(
-            collection_name=COLLECTION_NAME,
+            collection_name=config.qdrant_collection,
             points_selector=[memory_id],
         )
         return True
@@ -324,7 +323,7 @@ def delete_memories_for_chat(chat_id: str, user_id: str | None = None) -> int:
     try:
         # Get all memories for this chat
         results, _ = client.scroll(
-            collection_name=COLLECTION_NAME,
+            collection_name=config.qdrant_collection,
             scroll_filter=Filter(
                 must=[
                     FieldCondition(key="user_id", match=MatchValue(value=user_id)),
@@ -341,7 +340,7 @@ def delete_memories_for_chat(chat_id: str, user_id: str | None = None) -> int:
         # Delete all matching points
         point_ids = [str(point.id) for point in results]
         client.delete(
-            collection_name=COLLECTION_NAME,
+            collection_name=config.qdrant_collection,
             points_selector=point_ids,
         )
         

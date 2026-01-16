@@ -1,5 +1,6 @@
 """
 Database Layer - SQLite with FTS5, WAL mode, and Phase 3 summary support.
+Phase 4: Environment-aware database paths.
 """
 import sqlite3
 import uuid
@@ -8,14 +9,13 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional
 
-# Database file location
-DB_PATH = Path(__file__).parent / "data" / "megpt.db"
+from config import config
 
 
 def get_db_path() -> Path:
     """Ensure data directory exists and return DB path."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return DB_PATH
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    return config.db_path
 
 
 @contextmanager
@@ -88,7 +88,8 @@ def init_db():
             END
         """)
         
-        print("✓ Database initialized with WAL mode")
+        env_badge = "PROD" if config.is_production else "DEV"
+        print(f"✓ Database initialized [{env_badge}]: {get_db_path()}")
 
 
 # ========== Chat CRUD ==========

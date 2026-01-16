@@ -1,6 +1,6 @@
 """
 FastAPI Backend Server - SSE streaming with Vercel AI Data Stream Protocol.
-Phase 3: 3-Tier Memory Architecture with Background Summarization.
+Phase 4: 3-Tier Memory + Admin endpoints for backup/restore.
 """
 import json
 from typing import Optional
@@ -19,6 +19,9 @@ from tools.memory_tool import (
     delete_memory, delete_memories_for_chat
 )
 from tools.summary_tool import summarize_chat_background
+from tools.backup_tool import (
+    create_backup, list_backups, restore_backup, rollback_latest, get_backup_info
+)
 from utils.llm_factory import get_llm
 from utils.model_loader import ensure_models_loaded
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
@@ -26,7 +29,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Base
 app = FastAPI(
     title="MeGPT Pro API",
     description="Privacy-first AI assistant with persistent memory",
-    version="3.0.0"
+    version="4.0.0"
 )
 
 
@@ -332,6 +335,85 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
             "x-vercel-ai-ui-message-stream": "v1",
         }
     )
+
+
+# ========== Admin Endpoints (Phase 4) ==========
+
+class BackupCreate(BaseModel):
+    description: Optional[str] = ""
+
+
+class RestoreRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.get("/api/admin/env")
+async def get_environment():
+    """Get current environment info."""
+    return {
+        "env_mode": config.env_mode,
+        "is_production": config.is_production,
+        "data_dir": str(config.data_dir),
+        "qdrant_collection": config.qdrant_collection,
+        "backup_interval_hours": config.backup_interval_hours,
+        "backup_retention_count": config.backup_retention_count,
+    }
+
+
+@app.get("/api/admin/backups")
+async def list_backups_endpoint():
+    """List all available backups."""
+    backups = list_backups()
+    return [{"id": b.id, "timestamp": b.timestamp, "env_mode": b.env_mode,
+             "chat_count": b.chat_count, "message_count": b.message_count,
+             "memory_count": b.memory_count} for b in backups]
+
+
+@app.post("/api/admin/backup")
+async def create_backup_endpoint(data: BackupCreate):
+    """Create a new backup."""
+    backup = create_backup(data.description)
+    if not backup:
+        raise HTTPException(status_code=500, detail="Backup failed")
+    return {
+        "success": True,
+        "backup_id": backup.id,
+        "chat_count": backup.chat_count,
+        "message_count": backup.message_count,
+        "memory_count": backup.memory_count,
+    }
+
+
+@app.post("/api/admin/restore/{backup_id}")
+async def restore_backup_endpoint(backup_id: str, data: RestoreRequest):
+    """Restore from a specific backup."""
+    # Require confirmation for production
+    if config.is_production and not data.confirm:
+        raise HTTPException(
+            status_code=400, 
+            detail="Production restore requires confirm=true"
+        )
+    
+    success = restore_backup(backup_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Restore failed")
+    return {"success": True, "restored_from": backup_id}
+
+
+@app.post("/api/admin/rollback")
+async def rollback_endpoint(data: RestoreRequest):
+    """Rollback to the most recent backup."""
+    # Require confirmation for production
+    if config.is_production and not data.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Production rollback requires confirm=true"
+        )
+    
+    success = rollback_latest()
+    if not success:
+        raise HTTPException(status_code=500, detail="Rollback failed")
+    return {"success": True}
 
 
 if __name__ == "__main__":
