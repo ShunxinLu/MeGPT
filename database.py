@@ -1,5 +1,5 @@
 """
-Database Layer - SQLite with FTS5 for chat persistence and search.
+Database Layer - SQLite with FTS5, WAL mode, and Phase 3 summary support.
 """
 import sqlite3
 import uuid
@@ -20,9 +20,11 @@ def get_db_path() -> Path:
 
 @contextmanager
 def get_connection():
-    """Context manager for database connections."""
+    """Context manager for database connections with WAL mode."""
     conn = sqlite3.connect(get_db_path())
     conn.row_factory = sqlite3.Row
+    # CRITICAL: Enable Write-Ahead Logging to allow simultaneous Read/Write
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
@@ -37,16 +39,23 @@ def get_connection():
 def init_db():
     """Initialize the database schema."""
     with get_connection() as conn:
-        # Core tables
+        # Core tables - Phase 3: Added summary column
         conn.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
                 title TEXT,
+                summary TEXT DEFAULT '',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # Add summary column if it doesn't exist (for migration)
+        try:
+            conn.execute("ALTER TABLE chats ADD COLUMN summary TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -79,7 +88,7 @@ def init_db():
             END
         """)
         
-        print("✓ Database initialized")
+        print("✓ Database initialized with WAL mode")
 
 
 # ========== Chat CRUD ==========
@@ -91,8 +100,8 @@ def create_chat(user_id: str, title: Optional[str] = None) -> dict:
     
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO chats (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (chat_id, user_id, title or "New Chat", now, now)
+            "INSERT INTO chats (id, user_id, title, summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, user_id, title or "New Chat", "", now, now)
         )
     
     return {"id": chat_id, "user_id": user_id, "title": title or "New Chat", "created_at": now}
@@ -133,6 +142,56 @@ def delete_chat(chat_id: str):
         conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
 
 
+# ========== Phase 3: Summary Functions ==========
+
+def get_summary(chat_id: str) -> str:
+    """Get the rolling summary for a chat (Tier 3)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT summary FROM chats WHERE id = ?", 
+            (chat_id,)
+        ).fetchone()
+    
+    return row["summary"] if row and row["summary"] else ""
+
+
+def update_summary(chat_id: str, summary: str):
+    """Update the rolling summary for a chat."""
+    now = datetime.utcnow().isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE chats SET summary = ?, updated_at = ? WHERE id = ?",
+            (summary, now, chat_id)
+        )
+
+
+def get_message_count(chat_id: str) -> int:
+    """Get the count of messages in a chat."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as count FROM messages WHERE chat_id = ?",
+            (chat_id,)
+        ).fetchone()
+    
+    return row["count"] if row else 0
+
+
+def get_recent_messages_text(chat_id: str, limit: int = 20) -> str:
+    """Get recent messages as formatted text for summarization."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT role, content FROM messages 
+               WHERE chat_id = ? 
+               ORDER BY created_at DESC 
+               LIMIT ?""",
+            (chat_id, limit)
+        ).fetchall()
+    
+    # Reverse to get chronological order
+    messages = list(reversed(rows))
+    return "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+
+
 # ========== Message CRUD ==========
 
 def add_message(chat_id: str, role: str, content: str) -> dict:
@@ -154,13 +213,23 @@ def add_message(chat_id: str, role: str, content: str) -> dict:
     return {"id": msg_id, "chat_id": chat_id, "role": role, "content": content, "created_at": now}
 
 
-def get_messages(chat_id: str) -> list[dict]:
-    """Get all messages for a chat, ordered chronologically."""
+def get_messages(chat_id: str, limit: Optional[int] = None) -> list[dict]:
+    """Get messages for a chat, ordered chronologically. Optional limit for recent messages."""
     with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at ASC",
-            (chat_id,)
-        ).fetchall()
+        if limit:
+            # Get last N messages
+            rows = conn.execute(
+                """SELECT * FROM messages WHERE chat_id = ? 
+                   ORDER BY created_at DESC LIMIT ?""",
+                (chat_id, limit)
+            ).fetchall()
+            # Reverse to get chronological order
+            rows = list(reversed(rows))
+        else:
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at ASC",
+                (chat_id,)
+            ).fetchall()
     
     return [dict(row) for row in rows]
 

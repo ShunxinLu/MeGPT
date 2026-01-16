@@ -1,10 +1,10 @@
 """
 FastAPI Backend Server - SSE streaming with Vercel AI Data Stream Protocol.
-Exposes the LangGraph agent via REST API with chat persistence and memory management.
+Phase 3: 3-Tier Memory Architecture with Background Summarization.
 """
 import json
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -12,12 +12,13 @@ from pydantic import BaseModel
 from config import config
 from database import (
     create_chat, get_chats, get_chat, update_chat_title, delete_chat,
-    add_message, get_messages, search_chats
+    add_message, get_messages, search_chats, get_summary, get_message_count
 )
 from tools.memory_tool import (
     retrieve_context, save_interaction, get_all_memories, 
     delete_memory, delete_memories_for_chat
 )
+from tools.summary_tool import summarize_chat_background
 from utils.llm_factory import get_llm
 from utils.model_loader import ensure_models_loaded
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
@@ -25,7 +26,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Base
 app = FastAPI(
     title="MeGPT Pro API",
     description="Privacy-first AI assistant with persistent memory",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 
@@ -77,11 +78,15 @@ class HealthResponse(BaseModel):
     qdrant_host: str
 
 
-# ========== System Prompt ==========
+# ========== Phase 3: System Prompt with 3-Tier Context ==========
 
 SYSTEM_PROMPT = """You are MeGPT, a helpful AI assistant with persistent long-term memory and web search capabilities.
 
-{memory_context}
+[LONG-TERM MEMORY - What you know about the user]
+{memory_facts}
+
+[CURRENT CONVERSATION SUMMARY]
+{conversation_summary}
 
 Important facts about yourself:
 - You DO have long-term memory that persists across conversations
@@ -92,6 +97,7 @@ Important facts about yourself:
 Guidelines:
 - Be conversational and helpful
 - When asked about your memory, confirm that you DO remember things
+- Use the information from your memory to personalize responses
 - Format code blocks with proper syntax highlighting using ```language
 - Be concise but thorough"""
 
@@ -116,29 +122,52 @@ def format_event(event_type: str, content: str) -> str:
     return f'0:{json.dumps({"type": event_type, "content": content})}\n'
 
 
-async def stream_response(messages: list[Message], user_id: str, chat_id: Optional[str] = None):
+async def stream_response(
+    messages: list[Message], 
+    user_id: str, 
+    chat_id: Optional[str] = None,
+    background_tasks: Optional[BackgroundTasks] = None
+):
     """
-    Stream the LLM response with tool status events.
-    Uses Vercel AI Data Stream Protocol for transparency.
+    Stream the LLM response with 3-tier context.
+    Phase 3: Combines Tier 1 (Recent), Tier 2 (Facts), Tier 3 (Summary).
     """
     # Get the last user message
     user_messages = [m for m in messages if m.role == "user"]
     last_user_input = user_messages[-1].content if user_messages else ""
     
-    # Stream: Memory recall status
+    # ========== TIER 2: Semantic Facts from Vector DB ==========
     yield format_event("status", "🧠 Recalling memories...")
     
-    # Retrieve memory context
     try:
-        context = retrieve_context(last_user_input, user_id)
+        memory_facts = retrieve_context(last_user_input, user_id)
     except Exception:
-        context = ""
+        memory_facts = ""
     
-    memory_section = context if context else "No prior memories about this user yet."
-    system_content = SYSTEM_PROMPT.format(memory_context=memory_section)
+    facts_section = memory_facts if memory_facts else "No prior memories about this user yet."
+    
+    # ========== TIER 3: Rolling Conversation Summary ==========
+    conversation_summary = ""
+    if chat_id:
+        try:
+            conversation_summary = get_summary(chat_id)
+        except Exception:
+            pass
+    
+    summary_section = conversation_summary if conversation_summary else "No summary yet for this conversation."
+    
+    # Build system prompt with 3-tier context
+    system_content = SYSTEM_PROMPT.format(
+        memory_facts=facts_section,
+        conversation_summary=summary_section
+    )
+    
+    # ========== TIER 1: Recent Messages (already in messages list) ==========
+    # Note: Frontend sends only recent messages, but we limit to last 10 for safety
+    recent_messages = messages[-10:] if len(messages) > 10 else messages
     
     # Convert messages and add system prompt
-    langchain_messages = [SystemMessage(content=system_content)] + convert_messages(messages)
+    langchain_messages = [SystemMessage(content=system_content)] + convert_messages(recent_messages)
     
     # Stream: Generating status
     yield format_event("status", "💭 Thinking...")
@@ -158,6 +187,17 @@ async def stream_response(messages: list[Message], user_id: str, chat_id: Option
         if full_response and last_user_input:
             try:
                 save_interaction(last_user_input, full_response, user_id, chat_id)
+            except Exception:
+                pass
+        
+        # ========== PHASE 3: Trigger Background Summary ==========
+        # Every 5th message, update the rolling summary
+        if chat_id and background_tasks:
+            try:
+                msg_count = get_message_count(chat_id)
+                if msg_count > 0 and msg_count % 5 == 0:
+                    background_tasks.add_task(summarize_chat_background, chat_id)
+                    print(f"📝 Scheduled background summary for chat {chat_id[:8]}...")
             except Exception:
                 pass
         
@@ -218,15 +258,21 @@ async def update_chat_endpoint(chat_id: str, data: ChatUpdate):
 
 @app.delete("/api/chats/{chat_id}")
 async def delete_chat_endpoint(chat_id: str, user_id: Optional[str] = None):
-    """Delete a chat with cascading memory deletion."""
+    """
+    Delete a chat with cascading memory deletion.
+    Phase 3: Wipes Tier 1 (Archive), Tier 2 (Facts), and Tier 3 (Summary).
+    """
     uid = user_id or config.user_id
     
-    # Delete related memories first
+    print(f"🗑️ Starting cascading delete for chat {chat_id[:8]}...")
+    
+    # STEP 1: Vector Wipe (Tier 2) - Delete related memories from Qdrant
     deleted_memories = delete_memories_for_chat(chat_id, uid)
     
-    # Delete the chat (cascades to messages)
+    # STEP 2: SQL Wipe (Tier 1 & Tier 3) - ON DELETE CASCADE handles messages
     delete_chat(chat_id)
     
+    print(f"✓ Chat and {deleted_memories} memories permanently scrubbed")
     return {"success": True, "deleted_memories": deleted_memories}
 
 
@@ -265,10 +311,10 @@ async def delete_memory_endpoint(memory_id: str):
 # ========== Chat Streaming Endpoint ==========
 
 @app.post("/api/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks):
     """
     Chat endpoint with SSE streaming.
-    Uses Vercel AI Data Stream Protocol for tool transparency.
+    Phase 3: Uses 3-tier memory with background summarization.
     """
     if not request.messages:
         raise HTTPException(status_code=400, detail="No messages provided")
@@ -277,7 +323,7 @@ async def chat_endpoint(request: ChatRequest):
     chat_id = request.chat_id
     
     return StreamingResponse(
-        stream_response(request.messages, user_id, chat_id),
+        stream_response(request.messages, user_id, chat_id, background_tasks),
         media_type="text/plain; charset=utf-8",
         headers={
             "Cache-Control": "no-cache",
