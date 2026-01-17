@@ -119,19 +119,46 @@ def create_agent_graph():
         context = state.get("context", {})
         messages = state.get("messages", [])
         
-        # Build system message with 3-tier context
-        facts_section = context.get("facts", "") or "No prior memories about this user yet."
-        summary_section = context.get("summary", "") or "No summary yet."
+        # CRITICAL FIX: Use DB-fetched history, not truncated server input
+        # This bridges the gap between the rolling summary and the current turn
+        facts = context.get("facts", "") or "No prior facts."
+        summary = context.get("summary", "") or "No summary yet."
+        recent_history_str = context.get("recent_history", "")
         
+        # Build comprehensive system prompt
         system_content = SYSTEM_PROMPT.format(
-            memory_facts=facts_section,
-            conversation_summary=summary_section
+            memory_facts=facts,
+            conversation_summary=summary
         )
         
-        # Prepare messages for LLM
-        full_messages = [SystemMessage(content=system_content)] + messages
+        # Inject DB history as a context refresh
+        # This ensures the LLM sees messages that might have been truncated by the server
+        # but are still in the DB (the "gap" between summary and current input)
+        if recent_history_str:
+            context_refresh = f"""
+RECENT CONVERSATION HISTORY (from database):
+{recent_history_str}
+"""
+        else:
+            context_refresh = ""
         
-        print(f"Thought Reason node: Invoking LLM with {len(messages)} messages...")
+        # Get current input (last message from state)
+        current_input = messages[-1] if messages else HumanMessage(content="")
+        
+        # Construct the full message sequence:
+        # 1. System: Core instructions + Facts + Summary
+        # 2. System: Recent history dump (fills the gap)
+        # 3. Human: Current input
+        full_messages = [
+            SystemMessage(content=system_content)
+        ]
+        
+        if context_refresh:
+            full_messages.append(SystemMessage(content=context_refresh))
+        
+        full_messages.append(current_input)
+        
+        print(f"Thought Reason node: Invoking LLM with comprehensive context (DB history: {len(recent_history_str)} chars)...")
         
         # Get LLM response (may include tool_calls)
         response = llm_with_tools.invoke(full_messages)

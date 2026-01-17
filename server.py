@@ -122,10 +122,10 @@ async def stream_response(
     yield format_event("status", "🧠 Recalling memories...")
     
     # ========== CONTEXT TRUNCATION (Prevent 4k overflow) ==========
-    # STRATEGY: Rely on Tier 3 (Summary) for older context, pass minimal raw history
-    # With long responses (Italy itinerary = 700+ tokens each), even 8 messages overflow
-    # The summary contains the full conversation context in ~200 tokens
-    MAX_HISTORY = 3  # Only last 3 messages - summary covers the rest
+    # STRATEGY: Overlap with summary. Summary updates every 5 messages.
+    # We need MAX_HISTORY > 5 to ensure no gaps between summary and truncation window.
+    # The agent_graph now uses DB-fetched history, so this is just a safety net.
+    MAX_HISTORY = 8  # Covers gap between summary updates (every 5 msgs) 
     
     # Exclude the very last message (current input) to process it separately
     recent_messages = messages[:-1] if len(messages) > 1 else []

@@ -177,8 +177,8 @@ def get_message_count(chat_id: str) -> int:
     return row["count"] if row else 0
 
 
-def get_recent_messages_text(chat_id: str, limit: int = 20) -> str:
-    """Get recent messages as formatted text for summarization."""
+def get_recent_messages_text(chat_id: str, limit: int = 15) -> str:
+    """Get recent messages as formatted text for summarization (Tier 1)."""
     with get_connection() as conn:
         rows = conn.execute(
             """SELECT role, content FROM messages 
