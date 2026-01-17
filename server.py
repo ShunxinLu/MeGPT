@@ -121,8 +121,21 @@ async def stream_response(
     # Status: Starting
     yield format_event("status", "🧠 Recalling memories...")
     
-    # Convert messages to LangChain format (exclude last user message - we pass it separately)
-    history = convert_messages(messages[:-1]) if len(messages) > 1 else []
+    # ========== CONTEXT TRUNCATION (Prevent 4k overflow) ==========
+    # We rely on Tier 3 (Summary) for older context.
+    # Only pass the last ~8 messages for immediate conversational flow.
+    MAX_HISTORY = 8
+    
+    # Exclude the very last message (current input) to process it separately
+    recent_messages = messages[:-1] if len(messages) > 1 else []
+    
+    # Truncate to last N messages
+    if len(recent_messages) > MAX_HISTORY:
+        recent_messages = recent_messages[-MAX_HISTORY:]
+        print(f"✂️ Truncated history to last {MAX_HISTORY} messages (was {len(messages)-1})")
+    
+    # Convert to LangChain format
+    history = convert_messages(recent_messages) if recent_messages else []
     
     # Add the current user message
     history.append(HumanMessage(content=last_user_input))
