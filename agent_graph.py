@@ -185,20 +185,16 @@ def create_agent_graph():
         }
     
     def respond_node(state: AgentState) -> AgentState:
-        """Node 4: Extract final response from last message, or synthesize from tool results."""
+        """Node 4: Synthesize final response from tool results + History."""
         messages = state.get("messages", [])
-        context = state.get("context", {})
+        user_input = state.get("user_input", "")
         
         print(f"📋 [RESPOND] Processing {len(messages)} messages")
-        for i, msg in enumerate(messages):
-            msg_type = type(msg).__name__
-            content_len = len(msg.content) if hasattr(msg, 'content') and msg.content else 0
-            print(f"   [{i}] {msg_type}: {content_len} chars")
         
         if messages:
             last_message = messages[-1]
             
-            # If we have an AIMessage with content, use it
+            # If we have an AIMessage with content, use it directly
             if isinstance(last_message, AIMessage) and last_message.content:
                 print(f"   → Using last AIMessage content ({len(last_message.content)} chars)")
                 return {
@@ -206,42 +202,53 @@ def create_agent_graph():
                     "final_response": last_message.content
                 }
             
-            # If no content (e.g., only tool_calls), synthesize from tool results
-            # Scan ALL messages for ToolMessages
+            # Collect tool results for synthesis
             tool_results = []
             for msg in messages:
                 if isinstance(msg, ToolMessage):
                     tool_results.append(msg.content)
-                    print(f"   📦 Found ToolMessage ({len(msg.content)} chars): {msg.content[:100]}...")
             
-            print(f"   📊 Total tool results: {len(tool_results)}")
+            print(f"   📊 Found {len(tool_results)} tool results")
             
             if tool_results:
-                # Combine all tool results
                 all_results = "\n\n---\n\n".join(tool_results)
                 
-                # Create a focused synthesis prompt that FORCES the LLM to use the data
-                synthesis_system = """You are a helpful assistant synthesizing search results.
+                # Build synthesis prompt with context
+                synthesis_prompt = f"""You are MeGPT. Answer the user's question using the Search Results below.
 
-CRITICAL INSTRUCTIONS:
-1. Your response MUST use the EXACT data, numbers, and prices from the search results below
-2. DO NOT make up or hallucinate any numbers, prices, or facts
-3. If the search results contain specific values (like "$260.10"), you MUST use those exact values
-4. Cite the sources provided in the search results
-5. If no specific data is found, say "I couldn't find specific current data" rather than guessing
+CONTEXT:
+The user asked: "{user_input}"
 
 SEARCH RESULTS:
-""" + all_results
+{all_results}
+
+INSTRUCTIONS:
+1. Synthesize a conversational answer based ONLY on the search results.
+2. Use EXACT numbers, prices, and facts from the results - do NOT make up data.
+3. Cite the 'SOURCE X' when referencing specific information.
+4. If the results don't contain the specific answer, admit it honestly.
+5. Keep your response concise and helpful.
+"""
                 
-                synthesis_messages = [
-                    SystemMessage(content=synthesis_system),
-                    HumanMessage(content=f"Based on ONLY the search results above, answer: {state.get('user_input', '')}")
+                # Include conversation history for context (excluding System and Tool messages)
+                # This allows the LLM to resolve pronouns like "he" or "it"
+                history_messages = [
+                    m for m in messages 
+                    if not isinstance(m, SystemMessage) and not isinstance(m, ToolMessage)
                 ]
                 
-                print(f"🔄 Synthesizing response from {len(tool_results)} tool results...")
-                print(f"   📝 First 300 chars: {all_results[:300]}...")
+                synthesis_messages = [
+                    SystemMessage(content="You are a helpful AI assistant."),
+                    *history_messages,  # Include history for context
+                    HumanMessage(content=synthesis_prompt)
+                ]
+                
+                print(f"🔄 Synthesizing with {len(history_messages)} history messages...")
+                print(f"   📝 Results preview: {all_results[:200]}...")
+                
                 llm = get_llm()
                 response = llm.invoke(synthesis_messages)
+                
                 print(f"   ✅ Synthesis complete: {len(response.content)} chars")
                 return {
                     **state,
@@ -250,7 +257,7 @@ SEARCH RESULTS:
         
         return {
             **state,
-            "final_response": "I apologize, I couldn't generate a response."
+            "final_response": "I couldn't find any information or tools to help with that."
         }
     
     def memorize_node(state: AgentState) -> AgentState:
