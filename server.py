@@ -1,6 +1,6 @@
 """
 FastAPI Backend Server - SSE streaming with Vercel AI Data Stream Protocol.
-Phase 4: 3-Tier Memory + Admin endpoints for backup/restore.
+Brain Transplant: Routes through agent_graph.py for proper tool execution.
 """
 import json
 from typing import Optional
@@ -12,17 +12,13 @@ from pydantic import BaseModel
 from config import config
 from database import (
     create_chat, get_chats, get_chat, update_chat_title, delete_chat,
-    add_message, get_messages, search_chats, get_summary, get_message_count
+    add_message, get_messages, search_chats, get_message_count
 )
-from tools.memory_tool import (
-    retrieve_context, save_interaction, get_all_memories, 
-    delete_memory, delete_memories_for_chat
-)
+from tools.memory_tool import get_all_memories, delete_memory, delete_memories_for_chat
 from tools.summary_tool import summarize_chat_background
 from tools.backup_tool import (
     create_backup, list_backups, restore_backup, rollback_latest, get_backup_info
 )
-from utils.llm_factory import get_llm
 from utils.model_loader import ensure_models_loaded
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 
@@ -81,40 +77,8 @@ class HealthResponse(BaseModel):
     qdrant_host: str
 
 
-# ========== Phase 3: System Prompt with 3-Tier Context ==========
-
-SYSTEM_PROMPT = """You are MeGPT, a helpful AI assistant with persistent long-term memory and web search capabilities.
-
-[LONG-TERM MEMORY - What you know about the user]
-{memory_facts}
-
-[CURRENT CONVERSATION SUMMARY]
-{conversation_summary}
-
-Important facts about yourself:
-- You DO have long-term memory that persists across conversations
-- You remember important facts about the user
-- You can learn new information and recall it later
-- You CAN search the web for current information
-
-TOOL USAGE:
-When you need to search the web for current/real-time information (stock prices, news, weather, etc.), output EXACTLY this format on its own line:
-[[SEARCH: your search query here]]
-
-After outputting the search command, STOP and wait. The system will execute the search and provide results.
-
-Example:
-User: What's the current price of Bitcoin?
-Assistant: I'll search for the current Bitcoin price.
-[[SEARCH: Bitcoin price today USD]]
-
-Guidelines:
-- Be conversational and helpful
-- When asked about your memory, confirm that you DO remember things
-- Use the information from your memory to personalize responses
-- Format code blocks with proper syntax highlighting using ```language
-- Be concise but thorough
-- ACTUALLY use the search tool when asked about current events - don't make up data!"""
+# ========== NOTE: SYSTEM_PROMPT is now in agent_graph.py ==========
+# The Agent Graph manages all context and tool execution.
 
 
 # ========== Helpers ==========
@@ -144,115 +108,63 @@ async def stream_response(
     background_tasks: Optional[BackgroundTasks] = None
 ):
     """
-    Stream the LLM response with 3-tier context.
-    Phase 3: Combines Tier 1 (Recent), Tier 2 (Facts), Tier 3 (Summary).
+    Stream the LLM response through the Agent Graph.
+    Brain Transplant: Routes through agent_graph.py for proper tool execution.
     """
+    from agent_graph import agent
+    from langchain_core.messages import HumanMessage
+    
     # Get the last user message
     user_messages = [m for m in messages if m.role == "user"]
     last_user_input = user_messages[-1].content if user_messages else ""
     
-    # ========== TIER 2: Semantic Facts from Vector DB ==========
+    # Status: Starting
     yield format_event("status", "🧠 Recalling memories...")
     
-    try:
-        memory_facts = retrieve_context(last_user_input, user_id)
-    except Exception:
-        memory_facts = ""
+    # Convert messages to LangChain format (exclude last user message - we pass it separately)
+    history = convert_messages(messages[:-1]) if len(messages) > 1 else []
     
-    facts_section = memory_facts if memory_facts else "No prior memories about this user yet."
-    
-    # ========== TIER 3: Rolling Conversation Summary ==========
-    conversation_summary = ""
-    if chat_id:
-        try:
-            conversation_summary = get_summary(chat_id)
-        except Exception:
-            pass
-    
-    summary_section = conversation_summary if conversation_summary else "No summary yet for this conversation."
-    
-    # Build system prompt with 3-tier context
-    system_content = SYSTEM_PROMPT.format(
-        memory_facts=facts_section,
-        conversation_summary=summary_section
-    )
-    
-    # ========== TIER 1: Recent Messages (already in messages list) ==========
-    # Note: Frontend sends only recent messages, but we limit to last 10 for safety
-    recent_messages = messages[-10:] if len(messages) > 10 else messages
-    
-    # Convert messages and add system prompt
-    langchain_messages = [SystemMessage(content=system_content)] + convert_messages(recent_messages)
-    
-    # Stream: Generating status
-    yield format_event("status", "💭 Thinking...")
-    
-    # Get streaming LLM (no bind_tools - using prompt-based tool calling)
-    import re
-    from tools.web_search import web_search
-    llm = get_llm(streaming=True)
+    # Add the current user message
+    history.append(HumanMessage(content=last_user_input))
     
     full_response = ""
-    search_pattern = re.compile(r'\[\[SEARCH:\s*(.+?)\]\]', re.IGNORECASE)
-    max_tool_iterations = 3
+    last_node = ""
     
     try:
-        for iteration in range(max_tool_iterations):
-            # Stream the response
-            buffer = ""
-            found_search = False
-            
-            async for chunk in llm.astream(langchain_messages):
-                if hasattr(chunk, "content") and chunk.content:
-                    content = chunk.content
-                    buffer += content
-                    
-                    # Check if we have a complete search command
-                    match = search_pattern.search(buffer)
-                    if match:
-                        # Found a search command!
-                        found_search = True
-                        query = match.group(1).strip()
-                        
-                        # Send text before the search command
-                        before_search = buffer[:match.start()]
-                        if before_search:
-                            full_response += before_search
-                            yield format_event("text", before_search)
-                        
-                        print(f"🔍 Detected search command: {query}")
-                        yield format_event("status", f"🔍 Searching: {query}...")
-                        
-                        # Execute the search
-                        search_result = web_search.invoke(query)
-                        print(f"🔍 Got {len(search_result)} chars of results")
-                        
-                        yield format_event("status", "📄 Processing results...")
-                        
-                        # Add the search result to messages and continue
-                        from langchain_core.messages import AIMessage
-                        langchain_messages.append(AIMessage(content=before_search + f"\n[Searched: {query}]"))
-                        langchain_messages.append(SystemMessage(content=f"SEARCH RESULTS for '{query}':\n\n{search_result}\n\nNow provide a helpful response using these search results. Do NOT use [[SEARCH:]] again."))
-                        
-                        break  # Break inner loop to restart with new context
-                    
-                    # Only yield if we haven't found a search yet
-                    if not found_search and "[[SEARCH" not in buffer:
-                        full_response += content
-                        yield format_event("text", content)
-            
-            if not found_search:
-                # No search found, we're done
-                break
+        # Stream from LangGraph using astream (yields state updates per node)
+        async for state_update in agent.astream(
+            input={
+                "messages": history,
+                "user_input": last_user_input,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "context": {},
+                "final_response": "",
+                "tool_call_count": 0
+            },
+            stream_mode="updates"  # Get updates per node
+        ):
+            # state_update is a dict with node name as key
+            for node_name, node_output in state_update.items():
+                print(f"🔄 Node '{node_name}' completed")
+                
+                # Track status based on node
+                if node_name == "recall":
+                    yield format_event("status", "🧠 Context loaded...")
+                elif node_name == "reason":
+                    yield format_event("status", "💭 Thinking...")
+                elif node_name == "tools":
+                    yield format_event("status", "🔎 Using web_search...")
+                elif node_name == "respond":
+                    # Get the final response from state
+                    final = node_output.get("final_response", "")
+                    if final:
+                        full_response = final
+                        yield format_event("text", final)
+                elif node_name == "memorize":
+                    yield format_event("status", "💾 Saved to memory")
         
-        # Save to memory after completion
-        if full_response and last_user_input:
-            try:
-                save_interaction(last_user_input, full_response, user_id, chat_id)
-            except Exception:
-                pass
-        
-        # ========== PHASE 3: Trigger Background Summary ==========
+        # ========== Background Summary ==========
         if chat_id and background_tasks:
             try:
                 msg_count = get_message_count(chat_id)
@@ -260,9 +172,11 @@ async def stream_response(
                     background_tasks.add_task(summarize_chat_background, chat_id)
             except Exception:
                 pass
-                pass
         
     except Exception as e:
+        print(f"❌ Stream error: {e}")
+        import traceback
+        traceback.print_exc()
         yield format_event("error", str(e))
 
 

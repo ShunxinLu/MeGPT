@@ -65,23 +65,33 @@ def _ensure_collection():
 
 
 def _get_embedding(text: str) -> Optional[list[float]]:
-    """Get embedding from local LM Studio embedding endpoint."""
-    try:
-        response = httpx.post(
-            f"{config.embedder_base_url}/embeddings",
-            json={
-                "model": config.embedder_model_name,
-                "input": text,
-            },
-            headers={"Authorization": f"Bearer {config.embedder_api_key}"},
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["data"][0]["embedding"]
-    except Exception as e:
-        print(f"⚠ Embedding failed: {e}")
-        return None
+    """Get embedding from local LM Studio embedding endpoint with retry."""
+    import time
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = httpx.post(
+                f"{config.embedder_base_url}/embeddings",
+                json={
+                    "model": config.embedder_model_name,
+                    "input": text,
+                },
+                headers={"Authorization": f"Bearer {config.embedder_api_key}"},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["data"][0]["embedding"]
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
+                print(f"⚠ Embedding attempt {attempt + 1} failed, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"⚠ Embedding failed after {max_retries} attempts: {e}")
+                return None
+    return None
 
 
 def retrieve_context(query: str, user_id: str | None = None) -> str:

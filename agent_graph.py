@@ -1,49 +1,64 @@
 """
 Agent Graph - LangGraph ReAct loop orchestration.
+Brain Transplant: Centralized 3-Tier Context with proper tool execution.
 Implements: Recall → Reason → Tool → Response → Memorize
 """
-from typing import TypedDict, Annotated, Literal
+from typing import TypedDict, Literal, Optional
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage, ToolMessage
 
 from utils.llm_factory import get_llm
 from tools.memory_tool import retrieve_context, save_interaction
 from tools.web_search import web_search
+from database import get_summary, get_recent_messages_text
 from config import config
 
 
-# Define the agent state
+# ========== Agent State ==========
+
 class AgentState(TypedDict):
     """State passed between nodes in the graph."""
     messages: list[BaseMessage]
-    context: str
     user_input: str
+    chat_id: Optional[str]
+    user_id: Optional[str]
+    context: dict  # {facts, summary, recent_history}
     final_response: str
+    tool_call_count: int  # Track tool iterations to prevent infinite loops
 
 
-# System prompt with memory context placeholder
-SYSTEM_PROMPT = """You are a helpful, intelligent AI assistant with access to long-term memory and web search capabilities.
+# ========== System Prompt (3-Tier) ==========
 
-{memory_context}
+SYSTEM_PROMPT = """You are MeGPT, a helpful AI assistant with persistent long-term memory and web search capabilities.
+
+[LONG-TERM MEMORY - Facts about the user]
+{memory_facts}
+
+[CONVERSATION SUMMARY]
+{conversation_summary}
+
+Important facts about yourself:
+- You DO have long-term memory that persists across conversations
+- You remember important facts about the user
+- You can learn new information and recall it later
+- You CAN and SHOULD search the web when asked about current events, prices, news, weather, etc.
 
 Guidelines:
 - Be conversational and helpful
-- Use web search when you need current information (news, weather, recent events)
-- Remember important facts about the user for future conversations
+- When asked about your memory, confirm that you DO remember things
+- Use the web_search tool for ANY question about current/real-time information
 - Format code blocks with proper syntax highlighting using ```language
 - Be concise but thorough
 
-Available tools:
-- web_search: Search the web for current information"""
+DO NOT HALLUCINATE DATA. If asked about current prices, news, etc., USE THE WEB SEARCH TOOL."""
 
 
 def create_agent_graph():
-    """Create and compile the LangGraph agent."""
+    """Create and compile the LangGraph agent with 3-tier context."""
     
     # Get LLM with tools bound
-    llm = get_llm(streaming=True)
+    llm = get_llm(streaming=False)  # Non-streaming for tool detection
     tools = [web_search]
     llm_with_tools = llm.bind_tools(tools)
     
@@ -51,31 +66,80 @@ def create_agent_graph():
     tool_node = ToolNode(tools)
     
     def recall_node(state: AgentState) -> AgentState:
-        """Node 1: Recall - Fetch relevant context from memory."""
+        """
+        Node 1: Recall - Fetch 3-Tier Context.
+        - Tier 1: Recent messages from DB
+        - Tier 2: Vector facts from Qdrant
+        - Tier 3: Rolling summary from DB
+        """
         user_input = state.get("user_input", "")
+        chat_id = state.get("chat_id")
+        user_id = state.get("user_id") or config.user_id
         
-        # Get context from memory
-        context = retrieve_context(user_input)
+        print(f"🧠 Recall node: Fetching 3-tier context...")
+        
+        # Tier 2: Vector Facts from Qdrant
+        facts = ""
+        try:
+            facts = retrieve_context(user_input, user_id)
+            print(f"  Tier 2: {len(facts)} chars of facts")
+        except Exception as e:
+            print(f"  Tier 2: Failed - {e}")
+        
+        # Tier 3: Rolling Summary
+        summary = ""
+        if chat_id:
+            try:
+                summary = get_summary(chat_id)
+                print(f"  Tier 3: {len(summary)} chars of summary")
+            except Exception as e:
+                print(f"  Tier 3: Failed - {e}")
+        
+        # Tier 1: Recent Messages (from DB, not state - ensures consistency)
+        recent_history = ""
+        if chat_id:
+            try:
+                recent_history = get_recent_messages_text(chat_id, limit=10)
+                print(f"  Tier 1: {len(recent_history)} chars of history")
+            except Exception as e:
+                print(f"  Tier 1: Failed - {e}")
         
         return {
             **state,
-            "context": context
+            "context": {
+                "facts": facts,
+                "summary": summary,
+                "recent_history": recent_history,
+            }
         }
     
     def reason_node(state: AgentState) -> AgentState:
         """Node 2: Reason - LLM decides response or tool use."""
-        context = state.get("context", "")
+        context = state.get("context", {})
         messages = state.get("messages", [])
         
-        # Build system message with memory context
-        memory_section = context if context else "No prior memories about this user."
-        system_content = SYSTEM_PROMPT.format(memory_context=memory_section)
+        # Build system message with 3-tier context
+        facts_section = context.get("facts", "") or "No prior memories about this user yet."
+        summary_section = context.get("summary", "") or "No summary yet."
+        
+        system_content = SYSTEM_PROMPT.format(
+            memory_facts=facts_section,
+            conversation_summary=summary_section
+        )
         
         # Prepare messages for LLM
         full_messages = [SystemMessage(content=system_content)] + messages
         
-        # Get LLM response
+        print(f"💭 Reason node: Invoking LLM with {len(messages)} messages...")
+        
+        # Get LLM response (may include tool_calls)
         response = llm_with_tools.invoke(full_messages)
+        
+        # Debug: Check for tool calls
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            print(f"🔧 Tool calls detected: {[tc.get('name') for tc in response.tool_calls]}")
+        else:
+            print(f"💬 Text response (no tools)")
         
         return {
             **state,
@@ -85,7 +149,15 @@ def create_agent_graph():
     def should_continue(state: AgentState) -> Literal["tools", "respond"]:
         """Edge condition: Check if we need to call tools."""
         messages = state.get("messages", [])
+        tool_count = state.get("tool_call_count", 0)
+        MAX_TOOL_CALLS = 3  # Limit tool iterations
+        
         if not messages:
+            return "respond"
+        
+        # Prevent infinite tool loops
+        if tool_count >= MAX_TOOL_CALLS:
+            print(f"⚠ Max tool calls ({MAX_TOOL_CALLS}) reached, forcing response...")
             return "respond"
         
         last_message = messages[-1]
@@ -95,16 +167,85 @@ def create_agent_graph():
             return "tools"
         return "respond"
     
+    def tools_wrapper_node(state: AgentState) -> AgentState:
+        """Wrapper around ToolNode that properly accumulates messages."""
+        # ToolNode returns {"messages": [ToolMessage, ...]} - just the NEW messages
+        tool_result = tool_node.invoke(state)
+        new_messages = tool_result.get("messages", [])
+        
+        # CRITICAL: Append new messages to existing, don't overwrite!
+        all_messages = state.get("messages", []) + new_messages
+        
+        print(f"   📬 Tool executed, added {len(new_messages)} messages, total: {len(all_messages)}")
+        
+        return {
+            **state,  # Keep ALL state fields
+            "messages": all_messages,  # Append messages
+            "tool_call_count": state.get("tool_call_count", 0) + 1
+        }
+    
     def respond_node(state: AgentState) -> AgentState:
-        """Node 4: Generate final response."""
+        """Node 4: Extract final response from last message, or synthesize from tool results."""
         messages = state.get("messages", [])
+        context = state.get("context", {})
+        
+        print(f"📋 [RESPOND] Processing {len(messages)} messages")
+        for i, msg in enumerate(messages):
+            msg_type = type(msg).__name__
+            content_len = len(msg.content) if hasattr(msg, 'content') and msg.content else 0
+            print(f"   [{i}] {msg_type}: {content_len} chars")
         
         if messages:
             last_message = messages[-1]
-            if isinstance(last_message, AIMessage):
+            
+            # If we have an AIMessage with content, use it
+            if isinstance(last_message, AIMessage) and last_message.content:
+                print(f"   → Using last AIMessage content ({len(last_message.content)} chars)")
                 return {
                     **state,
                     "final_response": last_message.content
+                }
+            
+            # If no content (e.g., only tool_calls), synthesize from tool results
+            # Scan ALL messages for ToolMessages
+            tool_results = []
+            for msg in messages:
+                if isinstance(msg, ToolMessage):
+                    tool_results.append(msg.content)
+                    print(f"   📦 Found ToolMessage ({len(msg.content)} chars): {msg.content[:100]}...")
+            
+            print(f"   📊 Total tool results: {len(tool_results)}")
+            
+            if tool_results:
+                # Combine all tool results
+                all_results = "\n\n---\n\n".join(tool_results)
+                
+                # Create a focused synthesis prompt that FORCES the LLM to use the data
+                synthesis_system = """You are a helpful assistant synthesizing search results.
+
+CRITICAL INSTRUCTIONS:
+1. Your response MUST use the EXACT data, numbers, and prices from the search results below
+2. DO NOT make up or hallucinate any numbers, prices, or facts
+3. If the search results contain specific values (like "$260.10"), you MUST use those exact values
+4. Cite the sources provided in the search results
+5. If no specific data is found, say "I couldn't find specific current data" rather than guessing
+
+SEARCH RESULTS:
+""" + all_results
+                
+                synthesis_messages = [
+                    SystemMessage(content=synthesis_system),
+                    HumanMessage(content=f"Based on ONLY the search results above, answer: {state.get('user_input', '')}")
+                ]
+                
+                print(f"🔄 Synthesizing response from {len(tool_results)} tool results...")
+                print(f"   📝 First 300 chars: {all_results[:300]}...")
+                llm = get_llm()
+                response = llm.invoke(synthesis_messages)
+                print(f"   ✅ Synthesis complete: {len(response.content)} chars")
+                return {
+                    **state,
+                    "final_response": response.content
                 }
         
         return {
@@ -113,13 +254,16 @@ def create_agent_graph():
         }
     
     def memorize_node(state: AgentState) -> AgentState:
-        """Node 5: Save interaction to memory (async in production)."""
+        """Node 5: Save interaction to memory."""
         user_input = state.get("user_input", "")
         final_response = state.get("final_response", "")
+        user_id = state.get("user_id") or config.user_id
+        chat_id = state.get("chat_id")
         
         if user_input and final_response:
             try:
-                save_interaction(user_input, final_response)
+                save_interaction(user_input, final_response, user_id, chat_id)
+                print(f"💾 Saved interaction to memory")
             except Exception as e:
                 print(f"⚠ Failed to save to memory: {e}")
         
@@ -131,7 +275,7 @@ def create_agent_graph():
     # Add nodes
     workflow.add_node("recall", recall_node)
     workflow.add_node("reason", reason_node)
-    workflow.add_node("tools", tool_node)
+    workflow.add_node("tools", tools_wrapper_node)
     workflow.add_node("respond", respond_node)
     workflow.add_node("memorize", memorize_node)
     
@@ -160,13 +304,20 @@ def create_agent_graph():
 agent = create_agent_graph()
 
 
-def run_agent(user_input: str, history: list[BaseMessage] | None = None) -> str:
+def run_agent(
+    user_input: str, 
+    history: list[BaseMessage] | None = None,
+    chat_id: str | None = None,
+    user_id: str | None = None,
+) -> str:
     """
     Run the agent with a user input and optional conversation history.
     
     Args:
         user_input: The user's message
         history: Optional list of previous messages
+        chat_id: Optional chat ID for context
+        user_id: Optional user ID
     
     Returns:
         The agent's response
@@ -177,49 +328,11 @@ def run_agent(user_input: str, history: list[BaseMessage] | None = None) -> str:
     # Run the graph
     result = agent.invoke({
         "messages": messages,
-        "context": "",
         "user_input": user_input,
+        "chat_id": chat_id,
+        "user_id": user_id or config.user_id,
+        "context": {},
         "final_response": ""
     })
     
     return result.get("final_response", "I couldn't generate a response.")
-
-
-async def run_agent_stream(user_input: str, history: list[BaseMessage] | None = None):
-    """
-    Stream the agent response token by token.
-    
-    Args:
-        user_input: The user's message
-        history: Optional list of previous messages
-    
-    Yields:
-        Text chunks as they are generated
-    """
-    messages = history or []
-    messages.append(HumanMessage(content=user_input))
-    
-    # Get context first
-    context = retrieve_context(user_input)
-    memory_section = context if context else "No prior memories about this user."
-    system_content = SYSTEM_PROMPT.format(memory_context=memory_section)
-    
-    full_messages = [SystemMessage(content=system_content)] + messages
-    
-    llm = get_llm(streaming=True)
-    tools = [web_search]
-    llm_with_tools = llm.bind_tools(tools)
-    
-    full_response = ""
-    
-    async for chunk in llm_with_tools.astream(full_messages):
-        if hasattr(chunk, "content") and chunk.content:
-            full_response += chunk.content
-            yield chunk.content
-    
-    # Save to memory after streaming completes
-    if full_response:
-        try:
-            save_interaction(user_input, full_response)
-        except Exception:
-            pass
