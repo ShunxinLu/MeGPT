@@ -1,9 +1,11 @@
 """
-Agent Graph - LangGraph ReAct loop orchestration.
+Agent Graph - LangGraph ReAct loop orchestration with Async support.
 Brain Transplant: Centralized 3-Tier Context with proper tool execution.
 Implements: Recall → Reason → Tool → Response → Memorize
 """
+import asyncio
 from typing import TypedDict, Literal, Optional
+from concurrent.futures import ThreadPoolExecutor
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage, ToolMessage
@@ -13,6 +15,10 @@ from tools.memory_tool import retrieve_context, save_interaction
 from tools.web_search import web_search
 from database import get_summary, get_recent_messages_text
 from config import config
+
+
+# Thread pool for blocking operations
+_executor = ThreadPoolExecutor(max_workers=10)
 
 
 # ========== Agent State ==========
@@ -55,10 +61,10 @@ DO NOT HALLUCINATE DATA. If asked about current prices, news, etc., USE THE WEB 
 
 
 def create_agent_graph():
-    """Create and compile the LangGraph agent with 3-tier context."""
+    """Create and compile the LangGraph agent."""
     
     # Get LLM with tools bound
-    llm = get_llm(streaming=False)  # Non-streaming for tool detection
+    llm = get_llm(streaming=False)
     tools = [web_search]
     llm_with_tools = llm.bind_tools(tools)
     
@@ -66,17 +72,12 @@ def create_agent_graph():
     tool_node = ToolNode(tools)
     
     def recall_node(state: AgentState) -> AgentState:
-        """
-        Node 1: Recall - Fetch 3-Tier Context.
-        - Tier 1: Recent messages from DB
-        - Tier 2: Vector facts from Qdrant
-        - Tier 3: Rolling summary from DB
-        """
+        """Node 1: Recall - Fetch 3-Tier Context."""
         user_input = state.get("user_input", "")
         chat_id = state.get("chat_id")
         user_id = state.get("user_id") or config.user_id
         
-        print(f"🧠 Recall node: Fetching 3-tier context...")
+        print("Brain Recall node: Fetching 3-tier context...")
         
         # Tier 2: Vector Facts from Qdrant
         facts = ""
@@ -95,7 +96,7 @@ def create_agent_graph():
             except Exception as e:
                 print(f"  Tier 3: Failed - {e}")
         
-        # Tier 1: Recent Messages (from DB, not state - ensures consistency)
+        # Tier 1: Recent Messages
         recent_history = ""
         if chat_id:
             try:
@@ -130,16 +131,16 @@ def create_agent_graph():
         # Prepare messages for LLM
         full_messages = [SystemMessage(content=system_content)] + messages
         
-        print(f"💭 Reason node: Invoking LLM with {len(messages)} messages...")
+        print(f"Thought Reason node: Invoking LLM with {len(messages)} messages...")
         
         # Get LLM response (may include tool_calls)
         response = llm_with_tools.invoke(full_messages)
         
         # Debug: Check for tool calls
         if hasattr(response, "tool_calls") and response.tool_calls:
-            print(f"🔧 Tool calls detected: {[tc.get('name') for tc in response.tool_calls]}")
+            print(f"Tool calls detected: {[tc.get('name') for tc in response.tool_calls]}")
         else:
-            print(f"💬 Text response (no tools)")
+            print("Text response (no tools)")
         
         return {
             **state,
@@ -157,7 +158,7 @@ def create_agent_graph():
         
         # Prevent infinite tool loops
         if tool_count >= MAX_TOOL_CALLS:
-            print(f"⚠ Max tool calls ({MAX_TOOL_CALLS}) reached, forcing response...")
+            print(f"Warning: Max tool calls ({MAX_TOOL_CALLS}) reached, forcing response...")
             return "respond"
         
         last_message = messages[-1]
@@ -169,34 +170,33 @@ def create_agent_graph():
     
     def tools_wrapper_node(state: AgentState) -> AgentState:
         """Wrapper around ToolNode that properly accumulates messages."""
-        # ToolNode returns {"messages": [ToolMessage, ...]} - just the NEW messages
         tool_result = tool_node.invoke(state)
         new_messages = tool_result.get("messages", [])
         
         # CRITICAL: Append new messages to existing, don't overwrite!
         all_messages = state.get("messages", []) + new_messages
         
-        print(f"   📬 Tool executed, added {len(new_messages)} messages, total: {len(all_messages)}")
+        print(f"   Tool executed, added {len(new_messages)} messages, total: {len(all_messages)}")
         
         return {
-            **state,  # Keep ALL state fields
-            "messages": all_messages,  # Append messages
+            **state,
+            "messages": all_messages,
             "tool_call_count": state.get("tool_call_count", 0) + 1
         }
     
     def respond_node(state: AgentState) -> AgentState:
-        """Node 4: Synthesize final response from tool results + History."""
+        """Node 4: Synthesize final response with Context Hygiene."""
         messages = state.get("messages", [])
         user_input = state.get("user_input", "")
         
-        print(f"📋 [RESPOND] Processing {len(messages)} messages")
+        print(f"[RESPOND] Processing {len(messages)} messages")
         
         if messages:
             last_message = messages[-1]
             
             # If we have an AIMessage with content, use it directly
             if isinstance(last_message, AIMessage) and last_message.content:
-                print(f"   → Using last AIMessage content ({len(last_message.content)} chars)")
+                print(f"   Using last AIMessage content ({len(last_message.content)} chars)")
                 return {
                     **state,
                     "final_response": last_message.content
@@ -208,48 +208,49 @@ def create_agent_graph():
                 if isinstance(msg, ToolMessage):
                     tool_results.append(msg.content)
             
-            print(f"   📊 Found {len(tool_results)} tool results")
+            print(f"   Found {len(tool_results)} tool results")
             
             if tool_results:
                 all_results = "\n\n---\n\n".join(tool_results)
                 
-                # Build synthesis prompt with context
-                synthesis_prompt = f"""You are MeGPT. Answer the user's question using the Search Results below.
+                # CONTEXT HYGIENE: Create a clean history for the LLM
+                # Keep: User messages, AI text responses (summaries)
+                # Remove: SystemMessages, ToolMessages, empty AIMessages
+                clean_history = []
+                for m in messages:
+                    if isinstance(m, HumanMessage):
+                        clean_history.append(m)
+                    elif isinstance(m, AIMessage) and m.content:
+                        clean_history.append(m)
+                
+                # Build synthesis prompt
+                synthesis_prompt = f"""You are MeGPT. Answer the user based on the Search Results.
 
 CONTEXT:
-The user asked: "{user_input}"
+User asked: "{user_input}"
 
 SEARCH RESULTS:
 {all_results}
 
 INSTRUCTIONS:
-1. Synthesize a conversational answer based ONLY on the search results.
-2. Use EXACT numbers, prices, and facts from the results - do NOT make up data.
-3. Cite the 'SOURCE X' when referencing specific information.
-4. If the results don't contain the specific answer, admit it honestly.
-5. Keep your response concise and helpful.
-"""
-                
-                # Include conversation history for context (excluding System and Tool messages)
-                # This allows the LLM to resolve pronouns like "he" or "it"
-                history_messages = [
-                    m for m in messages 
-                    if not isinstance(m, SystemMessage) and not isinstance(m, ToolMessage)
-                ]
-                
+1. Synthesize a conversational answer using ONLY the search results.
+2. Use EXACT numbers, prices, and facts - do NOT make up data.
+3. Cite sources (SOURCE 1, SOURCE 2, etc.) when referencing information.
+4. If results don't contain the answer, admit it honestly.
+5. Be concise."""
+
                 synthesis_messages = [
                     SystemMessage(content="You are a helpful AI assistant."),
-                    *history_messages,  # Include history for context
+                    *clean_history,
                     HumanMessage(content=synthesis_prompt)
                 ]
                 
-                print(f"🔄 Synthesizing with {len(history_messages)} history messages...")
-                print(f"   📝 Results preview: {all_results[:200]}...")
+                print(f"Synthesizing with {len(clean_history)} clean history messages...")
                 
                 llm = get_llm()
                 response = llm.invoke(synthesis_messages)
                 
-                print(f"   ✅ Synthesis complete: {len(response.content)} chars")
+                print(f"   Synthesis complete: {len(response.content)} chars")
                 return {
                     **state,
                     "final_response": response.content
@@ -257,7 +258,7 @@ INSTRUCTIONS:
         
         return {
             **state,
-            "final_response": "I couldn't find any information or tools to help with that."
+            "final_response": "I couldn't find any information to help with that."
         }
     
     def memorize_node(state: AgentState) -> AgentState:
@@ -270,9 +271,9 @@ INSTRUCTIONS:
         if user_input and final_response:
             try:
                 save_interaction(user_input, final_response, user_id, chat_id)
-                print(f"💾 Saved interaction to memory")
+                print("Saved interaction to memory")
             except Exception as e:
-                print(f"⚠ Failed to save to memory: {e}")
+                print(f"Warning: Failed to save to memory: {e}")
         
         return state
     
@@ -318,28 +319,45 @@ def run_agent(
     user_id: str | None = None,
 ) -> str:
     """
-    Run the agent with a user input and optional conversation history.
-    
-    Args:
-        user_input: The user's message
-        history: Optional list of previous messages
-        chat_id: Optional chat ID for context
-        user_id: Optional user ID
-    
-    Returns:
-        The agent's response
+    Run the agent synchronously (for testing).
     """
     messages = history or []
     messages.append(HumanMessage(content=user_input))
     
-    # Run the graph
     result = agent.invoke({
         "messages": messages,
         "user_input": user_input,
         "chat_id": chat_id,
         "user_id": user_id or config.user_id,
         "context": {},
-        "final_response": ""
+        "final_response": "",
+        "tool_call_count": 0
+    })
+    
+    return result.get("final_response", "I couldn't generate a response.")
+
+
+async def run_agent_async(
+    user_input: str, 
+    history: list[BaseMessage] | None = None,
+    chat_id: str | None = None,
+    user_id: str | None = None,
+) -> str:
+    """
+    Run the agent asynchronously (for FastAPI).
+    Uses ainvoke for non-blocking execution.
+    """
+    messages = history or []
+    messages.append(HumanMessage(content=user_input))
+    
+    result = await agent.ainvoke({
+        "messages": messages,
+        "user_input": user_input,
+        "chat_id": chat_id,
+        "user_id": user_id or config.user_id,
+        "context": {},
+        "final_response": "",
+        "tool_call_count": 0
     })
     
     return result.get("final_response", "I couldn't generate a response.")

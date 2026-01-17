@@ -50,11 +50,13 @@ def _format_results(results: list) -> str:
         return ""
     
     formatted = []
-    for i, res in enumerate(results, 1):
+    # Limit to top 4 results to prevent token explosion
+    for i, res in enumerate(results[:4], 1):
         title = res.get("title", "No title")
-        snippet = res.get("body", res.get("excerpt", "No content"))
+        # SAFE LIMIT: 1000 chars is plenty for context without exploding tokens
+        snippet = res.get("body", res.get("excerpt", "No content"))[:1000]
         url = res.get("href", res.get("url", "#"))
-        formatted.append(f"SOURCE {i}:\nTitle: {title}\nURL: {url}\nContent: {snippet}\n")
+        formatted.append(f"SOURCE {i}: {title}\nURL: {url}\nCONTENT: {snippet}\n")
 
     return "\n---\n".join(formatted)
 
