@@ -2,7 +2,9 @@
 Web Search Tool - Robust DuckDuckGo wrapper with retries and async support.
 Fixes stability issues by handling rate limits and HTTP errors gracefully.
 """
+
 import asyncio
+import atexit
 from concurrent.futures import ThreadPoolExecutor
 from ddgs import DDGS
 from langchain_core.tools import tool
@@ -18,27 +20,39 @@ RETRY_DELAY = 2  # Seconds base delay
 _executor = ThreadPoolExecutor(max_workers=5)
 
 
+def _cleanup_executor():
+    """Cleanup thread pool on exit."""
+    if _executor is not None:
+        _executor.shutdown(wait=True)
+
+
+# Register cleanup handler
+atexit.register(_cleanup_executor)
+
+
 def _safe_search(query: str, max_results: int = 5) -> list:
     """Synchronous search with retry logic and error handling."""
     last_error = None
-    
+
     for attempt in range(MAX_RETRIES):
         try:
             # Add delay on retries to avoid rate limiting
             if attempt > 0:
                 delay = RETRY_DELAY * (attempt + 1) + random.random()
-                print(f"   ⏳ Retry {attempt+1}/{MAX_RETRIES} after {delay:.1f}s delay...")
+                print(
+                    f"   ⏳ Retry {attempt + 1}/{MAX_RETRIES} after {delay:.1f}s delay..."
+                )
                 time.sleep(delay)
 
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=max_results))
                 print(f"   📥 Got {len(results)} results")
                 return results
-                
+
         except Exception as e:
-            print(f"   ⚠ Search attempt {attempt+1} failed: {e}")
+            print(f"   ⚠ Search attempt {attempt + 1} failed: {e}")
             last_error = e
-            
+
     # All retries exhausted
     print(f"   ❌ All {MAX_RETRIES} retries failed for: {query}")
     return []
@@ -48,7 +62,7 @@ def _format_results(results: list) -> str:
     """Format search results for the LLM."""
     if not results:
         return ""
-    
+
     formatted = []
     # Limit to top 4 results to prevent token explosion
     for i, res in enumerate(results[:4], 1):
@@ -66,15 +80,15 @@ def web_search(query: str) -> str:
     """
     Search the web for current information.
     Useful for news, facts, current events, or specific data not in your memory.
-    
+
     Args:
         query: The search query
-    
+
     Returns:
         Formatted search results with titles, snippets, and URLs
     """
     print(f"🔎 [WEB_SEARCH] Query: '{query}'")
-    
+
     if not config.enable_web_search:
         print("   ❌ Web search is disabled")
         return "Web search is disabled via config."
@@ -102,7 +116,7 @@ async def web_search_async(query: str) -> str:
     Use this in FastAPI endpoints to avoid blocking the event loop.
     """
     print(f"🔎 [WEB_SEARCH_ASYNC] Query: '{query}'")
-    
+
     if not config.enable_web_search:
         return "Web search is disabled via config."
 
@@ -123,14 +137,14 @@ async def web_search_async(query: str) -> str:
 def search_web_sync(query: str) -> list[dict]:
     """
     Synchronous web search for direct use (not as a LangChain tool).
-    
+
     Args:
         query: The search query
-    
+
     Returns:
         List of search result dictionaries
     """
     if not config.enable_web_search:
         return []
-    
+
     return _safe_search(query)

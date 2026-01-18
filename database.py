@@ -2,12 +2,15 @@
 Database Layer - SQLite with FTS5, WAL mode, and Phase 3 summary support.
 Phase 4: Environment-aware database paths.
 """
+import json
 import sqlite3
 import uuid
 from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional
+
+import httpx
 
 from config import config
 
@@ -248,6 +251,119 @@ def search_chats(user_id: str, query: str) -> list[dict]:
         """, (user_id, query)).fetchall()
     
     return [dict(row) for row in rows]
+
+
+# ========== Adaptive Context (Query-Aware Tier Selection) ==========
+
+
+def classify_query_intent(user_query: str) -> dict:
+    """
+    Use LLM to classify query intent for adaptive context selection.
+
+    Returns:
+        {
+            "intent": str,  # "followup" | "factual" | "overview" | "new_topic"
+            "needs_history": bool  # Whether to include recent messages
+        }
+    """
+    try:
+        response = httpx.post(
+            f"{config.llm_base_url}/chat/completions",
+            json={
+                "model": config.llm_model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"""Classify this query's intent. Reply with ONLY a JSON object.
+
+Query: "{user_query}"
+
+Categories:
+- "followup": References previous context ("what about X?", "and then?", "continue", "more details")
+- "factual": Asks for specific facts ("what's my favorite?", "where are we staying?", "who am I?")
+- "overview": Asks for summary/status ("catch me up", "what have we discussed?", "remind me")
+- "new_topic": Starts a fresh topic unrelated to prior context
+
+Reply format: {{"intent": "<category>", "needs_history": true/false}}""",
+                    }
+                ],
+                "max_tokens": 50,
+                "temperature": 0,
+            },
+            headers={"Authorization": f"Bearer {config.llm_api_key}"},
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        # Parse JSON from response (handle markdown code blocks)
+        if "```" in content:
+            content = content.split("```")[1].strip()
+            if content.startswith("json"):
+                content = content[4:].strip()
+        return json.loads(content)
+    except Exception as e:
+        print(f"⚠ Intent classification failed: {e}")
+        return {"intent": "general", "needs_history": True}
+
+
+def get_adaptive_context(user_query: str, chat_id: str, user_id: str) -> dict:
+    """
+    Returns context components based on query intent.
+    Uses LLM classification for intelligent tier selection.
+
+    3-Tier Memory Strategy:
+    - Tier 2 (Vector Facts): Always included - already query-relevant via embeddings
+    - Tier 3 (Rolling Summary): For overview queries or when context is needed
+    - Tier 1 (Recent Messages): For follow-ups requiring immediate continuity
+    """
+    # Import here to avoid circular imports
+    from tools.memory_tool import retrieve_context
+
+    # 1. Classify intent (cheap LLM call, ~50 tokens)
+    intent_result = classify_query_intent(user_query)
+    intent = intent_result.get("intent", "general")
+    needs_history = intent_result.get("needs_history", True)
+
+    print(f"📊 Query intent: {intent} (needs_history: {needs_history})")
+
+    # 2. Always get vector facts (they're query-relevant by definition)
+    facts = retrieve_context(user_query, user_id)
+
+    # 3. Adaptive tier selection based on intent
+    summary = ""
+    recent = ""
+
+    if intent == "overview":
+        # Overview query → prioritize summary, minimal recent
+        summary = get_summary(chat_id) if chat_id else ""
+        recent = get_recent_messages_text(chat_id, limit=2) if chat_id else ""
+
+    elif intent == "followup":
+        # Follow-up → prioritize recent context, skip summary
+        recent = get_recent_messages_text(chat_id, limit=5) if chat_id else ""
+
+    elif intent == "factual":
+        # Factual → vector facts are primary, summary if needed
+        summary = get_summary(chat_id) if (needs_history and chat_id) else ""
+        recent = ""
+
+    elif intent == "new_topic":
+        # New topic → just vector facts, no old context pollution
+        summary = ""
+        recent = ""
+
+    else:
+        # Default (general): include balanced context
+        summary = get_summary(chat_id) if chat_id else ""
+        recent = get_recent_messages_text(chat_id, limit=3) if chat_id else ""
+
+    return {
+        "facts": facts,
+        "summary": summary,
+        "recent": recent,
+        "intent": intent,
+        "needs_history": needs_history,
+    }
 
 
 # Initialize on import
