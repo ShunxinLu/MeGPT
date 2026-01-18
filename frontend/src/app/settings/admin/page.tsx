@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { ArrowLeft, Shield, Check, AlertCircle, RotateCcw, Database, HardDrive, Server, Clock, Save } from "lucide-react";
+import Link from "next/link";
 
 interface EnvironmentInfo {
     env_mode: string;
@@ -123,100 +125,165 @@ export default function AdminPage() {
 
     if (loading) {
         return (
-            <div className="flex items-center justify-center min-h-screen bg-gray-950">
-                <div className="text-gray-400">Loading admin panel...</div>
+            <div className="h-screen bg-void flex items-center justify-center">
+                <div className="flex flex-col items-center gap-4">
+                    <div className="w-10 h-10 border-2 border-violet-500 border-t-transparent rounded-full animate-spin"></div>
+                    <p className="text-zinc-500 font-mono text-sm animate-pulse">Initializing system control...</p>
+                </div>
             </div>
         );
     }
 
     return (
-        <div className="min-h-screen bg-gray-950 text-white p-8">
-            <div className="max-w-4xl mx-auto">
-                <h1 className="text-3xl font-bold mb-8">⚙️ Admin Panel</h1>
+        <div className="h-screen overflow-y-auto bg-void text-white relative">
+            {/* Background Texture */}
+            <div className="fixed inset-0 bg-noise opacity-[0.03] pointer-events-none"></div>
 
-                {/* Environment Status */}
-                <div className="bg-gray-900 rounded-xl p-6 mb-8">
-                    <h2 className="text-xl font-semibold mb-4">Environment</h2>
-                    {envInfo && (
-                        <div className="grid grid-cols-2 gap-4">
-                            <div>
-                                <span className="text-gray-400">Mode:</span>
-                                <span className={`ml-2 px-3 py-1 rounded-full text-sm font-medium ${envInfo.is_production
-                                        ? "bg-red-900/50 text-red-300 border border-red-700"
-                                        : "bg-green-900/50 text-green-300 border border-green-700"
-                                    }`}>
-                                    {envInfo.is_production ? "🔴 PRODUCTION" : "🟢 DEVELOPMENT"}
-                                </span>
-                            </div>
-                            <div>
-                                <span className="text-gray-400">Collection:</span>
-                                <span className="ml-2 text-gray-200">{envInfo.qdrant_collection}</span>
-                            </div>
-                            <div>
-                                <span className="text-gray-400">Data Dir:</span>
-                                <span className="ml-2 text-gray-200 text-sm">{envInfo.data_dir}</span>
-                            </div>
-                            <div>
-                                <span className="text-gray-400">Retention:</span>
-                                <span className="ml-2 text-gray-200">{envInfo.backup_retention_count} backups</span>
-                            </div>
+            {/* Header */}
+            <div className="sticky top-0 z-10 border-b border-white/5 bg-black/80 backdrop-blur-xl p-4">
+                <div className="max-w-4xl mx-auto flex items-center gap-4">
+                    <Link
+                        href="/"
+                        className="p-2 hover:bg-white/10 rounded-lg transition-colors text-zinc-400 hover:text-white"
+                    >
+                        <ArrowLeft size={20} />
+                    </Link>
+                    <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg bg-violet-500/10">
+                            <Shield className="text-violet-400" size={20} />
                         </div>
-                    )}
-                </div>
-
-                {/* Actions */}
-                <div className="bg-gray-900 rounded-xl p-6 mb-8">
-                    <h2 className="text-xl font-semibold mb-4">Actions</h2>
-
-                    {message && (
-                        <div className={`mb-4 p-3 rounded-lg ${message.type === "success" ? "bg-green-900/50 text-green-300" : "bg-red-900/50 text-red-300"
-                            }`}>
-                            {message.text}
-                        </div>
-                    )}
-
-                    <div className="flex gap-4">
-                        <button
-                            onClick={createBackup}
-                            disabled={actionLoading}
-                            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium disabled:opacity-50"
-                        >
-                            📦 Create Backup
-                        </button>
-                        <button
-                            onClick={rollback}
-                            disabled={actionLoading || backups.length === 0}
-                            className="px-4 py-2 bg-orange-600 hover:bg-orange-700 rounded-lg font-medium disabled:opacity-50"
-                        >
-                            🔄 Rollback to Latest
-                        </button>
+                        <h1 className="text-xl font-bold font-sans tracking-tight">System Backup & Recovery</h1>
                     </div>
                 </div>
+            </div>
+
+            {/* Content */}
+            <div className="max-w-4xl mx-auto p-6 pb-20">
+
+                {/* Environment Status */}
+                <section className="mb-8">
+                    <h2 className="text-xs font-medium uppercase tracking-wider text-zinc-500 mb-4 font-mono ml-1">Current Environment</h2>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                        <div className="glass-panel p-4 rounded-xl flex flex-col gap-2">
+                            <div className="flex items-center gap-2 text-zinc-400 text-xs font-mono uppercase">
+                                <Server size={14} /> Mode
+                            </div>
+                            <div className="mt-1">
+                                <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${envInfo?.is_production
+                                    ? "bg-red-500/10 text-red-400 border-red-500/20"
+                                    : "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                                    }`}>
+                                    {envInfo?.is_production ? "PRODUCTION" : "DEVELOPMENT"}
+                                </span>
+                            </div>
+                        </div>
+
+                        <div className="glass-panel p-4 rounded-xl flex flex-col gap-2">
+                            <div className="flex items-center gap-2 text-zinc-400 text-xs font-mono uppercase">
+                                <Database size={14} /> Collection
+                            </div>
+                            <div className="font-mono text-sm text-zinc-200 truncate">
+                                {envInfo?.qdrant_collection}
+                            </div>
+                        </div>
+
+                        <div className="glass-panel p-4 rounded-xl flex flex-col gap-2">
+                            <div className="flex items-center gap-2 text-zinc-400 text-xs font-mono uppercase">
+                                <HardDrive size={14} /> Data Path
+                            </div>
+                            <div className="font-mono text-sm text-zinc-200 truncate" title={envInfo?.data_dir}>
+                                {envInfo?.data_dir}
+                            </div>
+                        </div>
+
+                        <div className="glass-panel p-4 rounded-xl flex flex-col gap-2">
+                            <div className="flex items-center gap-2 text-zinc-400 text-xs font-mono uppercase">
+                                <Clock size={14} /> Retention
+                            </div>
+                            <div className="font-mono text-sm text-zinc-200">
+                                {envInfo?.backup_retention_count} snapshots
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                {/* Actions */}
+                <section className="mb-10">
+                    <h2 className="text-xs font-medium uppercase tracking-wider text-zinc-500 mb-4 font-mono ml-1">Control Operations</h2>
+
+                    {message && (
+                        <div className={`mb-6 p-4 rounded-xl flex items-center gap-3 border ${message.type === "success"
+                                ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+                                : "bg-red-500/10 border-red-500/20 text-red-400"
+                            }`}>
+                            {message.type === "success" ? <Check size={18} /> : <AlertCircle size={18} />}
+                            <span className="font-medium text-sm">{message.text}</span>
+                        </div>
+                    )}
+
+                    <div className="bg-white/5 border border-white/10 rounded-2xl p-6 backdrop-blur-sm">
+                        <div className="flex flex-wrap gap-4">
+                            <button
+                                onClick={createBackup}
+                                disabled={actionLoading}
+                                className="flex items-center gap-2 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white rounded-xl font-medium shadow-lg shadow-violet-500/20 transition-all hover:scale-105 active:scale-95 disabled:opacity-50 disabled:pointer-events-none"
+                            >
+                                <Save size={18} />
+                                Create Snapshot
+                            </button>
+                            <button
+                                onClick={rollback}
+                                disabled={actionLoading || backups.length === 0}
+                                className="flex items-center gap-2 px-6 py-3 bg-white/5 hover:bg-white/10 text-zinc-200 border border-white/5 hover:border-white/10 rounded-xl font-medium transition-all hover:scale-105 active:scale-95 disabled:opacity-50 disabled:pointer-events-none"
+                            >
+                                <RotateCcw size={18} />
+                                Rollback to Latest
+                            </button>
+                        </div>
+                        <p className="mt-4 text-xs text-zinc-500 font-mono">
+                            * Creating a snapshot triggers a full backup of the vector database and conversation logs.
+                        </p>
+                    </div>
+                </section>
 
                 {/* Backup List */}
-                <div className="bg-gray-900 rounded-xl p-6">
-                    <h2 className="text-xl font-semibold mb-4">Backups ({backups.length})</h2>
+                <section>
+                    <div className="flex items-center justify-between mb-4 px-1">
+                        <h2 className="text-xs font-medium uppercase tracking-wider text-zinc-500 font-mono">Snapshot History</h2>
+                        <span className="text-xs text-zinc-600 font-mono">{backups.length} entries</span>
+                    </div>
 
                     {backups.length === 0 ? (
-                        <p className="text-gray-400">No backups yet. Create one to get started.</p>
+                        <div className="text-center py-20 rounded-3xl border border-dashed border-white/10 bg-white/[0.02]">
+                            <Database size={48} className="mx-auto text-zinc-800 mb-4" />
+                            <p className="text-zinc-600">No backups found in local storage</p>
+                        </div>
                     ) : (
                         <div className="space-y-3">
                             {backups.map((backup) => (
                                 <div
                                     key={backup.id}
-                                    className="flex items-center justify-between p-4 bg-gray-800 rounded-lg"
+                                    className="group flex flex-col sm:flex-row sm:items-center justify-between p-5 bg-white/[0.03] border border-white/5 rounded-2xl hover:border-violet-500/30 hover:bg-white/[0.05] transition-all duration-300"
                                 >
-                                    <div>
-                                        <div className="font-medium">{backup.id}</div>
-                                        <div className="text-sm text-gray-400">
-                                            {new Date(backup.timestamp).toLocaleString()} •
-                                            {backup.chat_count} chats, {backup.message_count} msgs, {backup.memory_count} memories
+                                    <div className="mb-4 sm:mb-0">
+                                        <div className="flex items-center gap-3 mb-1">
+                                            <span className="font-mono text-zinc-300">{backup.id}</span>
+                                            {backup.id.includes("auto") && (
+                                                <span className="px-1.5 py-0.5 rounded text-[10px] uppercase font-bold bg-blue-500/10 text-blue-400 border border-blue-500/20">Auto</span>
+                                            )}
+                                        </div>
+                                        <div className="text-xs text-zinc-500 font-mono flex items-center gap-3">
+                                            <span>{new Date(backup.timestamp).toLocaleString()}</span>
+                                            <span className="w-1 h-1 rounded-full bg-zinc-700"></span>
+                                            <span>{backup.chat_count} chats</span>
+                                            <span className="w-1 h-1 rounded-full bg-zinc-700"></span>
+                                            <span>{backup.message_count} msgs</span>
                                         </div>
                                     </div>
                                     <button
                                         onClick={() => restoreBackup(backup.id)}
                                         disabled={actionLoading}
-                                        className="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm disabled:opacity-50"
+                                        className="px-4 py-2 text-sm bg-white/5 hover:bg-white/10 text-zinc-400 hover:text-white rounded-lg transition-colors border border-white/5 hover:border-white/10 opacity-0 group-hover:opacity-100 sm:translate-x-4 group-hover:translate-x-0"
                                     >
                                         Restore
                                     </button>
@@ -224,14 +291,7 @@ export default function AdminPage() {
                             ))}
                         </div>
                     )}
-                </div>
-
-                {/* Back Link */}
-                <div className="mt-8">
-                    <a href="/" className="text-blue-400 hover:underline">
-                        ← Back to Chat
-                    </a>
-                </div>
+                </section>
             </div>
         </div>
     );

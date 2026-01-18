@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
-import { AlertCircle, StopCircle, RefreshCw, Brain, Search } from "lucide-react";
+import { useState, useRef, useEffect } from "react";
+import { AlertCircle, StopCircle, RefreshCw, Brain, Search, Sparkles, Terminal } from "lucide-react";
 import MessageBubble from "./MessageBubble";
 import InputArea from "./InputArea";
 
@@ -99,7 +99,6 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
                         textContent += event.content;
                     }
                 } catch {
-                    // Non-JSON line, treat as plain text
                     textContent += line;
                 }
             } else if (line.trim()) {
@@ -113,7 +112,6 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
     const sendMessage = async (content: string, isRegenerate = false) => {
         if (!content.trim() || isLoading) return;
 
-        // Create chat if needed
         let activeChatId = currentChatId;
         if (!activeChatId) {
             activeChatId = await createChat(content);
@@ -134,14 +132,13 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
         setInput("");
         setIsLoading(true);
         setError(null);
-        setStatus("🧠 Recalling memories...");
+        setStatus("🧠 Accessing neural context...");
 
-        // Setup abort controller for stop button
         abortControllerRef.current = new AbortController();
 
         try {
             const messagesToSend = isRegenerate
-                ? messages.slice(0, -1) // Remove last assistant message for regenerate
+                ? messages.slice(0, -1)
                 : [...messages, userMessage];
 
             const response = await fetch("/api/chat", {
@@ -174,7 +171,6 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
                 const chunk = decoder.decode(value, { stream: true });
                 const { events, textContent } = parseStreamEvents(chunk);
 
-                // Update status from events
                 for (const event of events) {
                     if (event.type === "status") {
                         setStatus(event.content);
@@ -185,7 +181,6 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
 
                 fullText += textContent;
 
-                // Update assistant message in real-time
                 setMessages(prev => {
                     const newMessages = [...prev];
                     const lastMsg = newMessages[newMessages.length - 1];
@@ -202,7 +197,6 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
                 });
             }
 
-            // Save assistant message
             if (fullText) {
                 await saveMessage(activeChatId, "assistant", fullText);
             }
@@ -227,7 +221,6 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
 
     const handleRegenerate = () => {
         if (lastUserMessage && !isLoading) {
-            // Remove last assistant message
             setMessages(prev => prev.slice(0, -1));
             sendMessage(lastUserMessage, true);
         }
@@ -242,33 +235,44 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
     };
 
     return (
-        <div className="flex-1 flex flex-col h-screen bg-[#1e1e1e] overflow-hidden">
+        <div className="flex-1 flex flex-col h-screen text-zinc-100 relative overflow-hidden bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-[#131316] via-transparent to-transparent">
+            {/* Extended Background Texture */}
+            <div className="absolute inset-0 pointer-events-none opacity-[0.02]"
+                style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E")` }}>
+            </div>
+
             {/* Chat Messages Area */}
-            <div className="flex-1 overflow-y-auto p-6 pb-32">
-                <div className="max-w-3xl mx-auto space-y-6">
-                    {/* Welcome message if no messages */}
+            <div className="flex-1 overflow-y-auto px-4 md:px-8 pb-32 pt-6 scrollbar-thin z-10">
+                <div className="max-w-3xl mx-auto space-y-8">
+                    {/* Welcome Screen */}
                     {messages.length === 0 && (
-                        <div className="text-center py-20">
-                            <h2 className="text-3xl font-semibold gradient-text mb-4">
-                                Hello! I&apos;m MeGPT
+                        <div className="text-center py-24 animate-in">
+                            <div className="inline-flex justify-center items-center p-4 mb-8 bg-black/30 rounded-3xl border border-white/5 shadow-[0_0_50px_rgba(139,92,246,0.1)] relative overflow-hidden group">
+                                <div className="absolute inset-0 bg-gradient-to-tr from-violet-500/10 to-cyan-500/10 opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none"></div>
+                                <Sparkles size={40} className="text-violet-400 relative z-10 drop-shadow-[0_0_15px_rgba(139,92,246,0.8)]" />
+                            </div>
+                            <h2 className="text-6xl font-bold tracking-tight mb-6 font-sans">
+                                <span className="gradient-text">MeGPT</span>
                             </h2>
-                            <p className="text-[#9aa0a6] text-lg max-w-md mx-auto">
-                                Your privacy-first AI assistant with persistent memory.
-                                I remember our conversations and can search the web when needed.
+                            <p className="text-zinc-400 text-lg max-w-lg mx-auto leading-relaxed mb-12 font-light">
+                                Your persistent neural memory. I recall our past conversations to build deeper context over time, evolving with every interaction.
                             </p>
-                            <div className="mt-8 flex flex-wrap justify-center gap-3">
+
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 max-w-2xl mx-auto">
                                 {[
-                                    "Do you have long-term memory?",
-                                    "What's the weather like?",
-                                    "Help me with coding",
-                                ].map((suggestion) => (
+                                    { text: "Query my past memories", icon: <Brain size={16} />, delay: "0ms" },
+                                    { text: "Analyze this code block", icon: <Terminal size={16} />, delay: "100ms" },
+                                    { text: "Search the web for info", icon: <Search size={16} />, delay: "200ms" },
+                                ].map((suggestion, i) => (
                                     <button
-                                        key={suggestion}
+                                        key={suggestion.text}
                                         type="button"
-                                        onClick={() => handleSuggestionClick(suggestion)}
-                                        className="px-4 py-2 rounded-full bg-[#2f2f2f] hover:bg-[#3c4043] text-sm transition-colors"
+                                        onClick={() => handleSuggestionClick(suggestion.text)}
+                                        style={{ animationDelay: suggestion.delay }}
+                                        className="flex items-center justify-center gap-3 px-5 py-4 rounded-2xl bg-white/5 hover:bg-white/10 border border-white/5 hover:border-violet-500/30 text-sm text-zinc-300 transition-all hover:-translate-y-1 hover:shadow-lg hover:shadow-violet-500/10 animate-in opacity-0 fill-mode-forwards"
                                     >
-                                        {suggestion}
+                                        <span className="text-violet-400">{suggestion.icon}</span>
+                                        <span>{suggestion.text}</span>
                                     </button>
                                 ))}
                             </div>
@@ -277,71 +281,58 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
 
                     {/* Messages */}
                     {messages.map((message) => (
-                        <MessageBubble
-                            key={message.id}
-                            role={message.role}
-                            content={message.content}
-                            isStreaming={isLoading && message.role === "assistant" && message === messages[messages.length - 1]}
-                        />
+                        <div key={message.id} className="message-enter">
+                            <MessageBubble
+                                role={message.role}
+                                content={message.content}
+                                isStreaming={isLoading && message.role === "assistant" && message === messages[messages.length - 1]}
+                            />
+                        </div>
                     ))}
 
                     {/* Thinking Indicator */}
                     {isLoading && status && (
-                        <div className="flex items-center gap-3 text-[#9aa0a6] bg-[#2f2f2f] p-3 rounded-xl">
-                            <div className="flex items-center gap-2">
-                                {status.includes("🧠") && <Brain size={18} className="text-purple-400 animate-pulse" />}
-                                {status.includes("🔎") && <Search size={18} className="text-blue-400 animate-pulse" />}
-                                {!status.includes("🧠") && !status.includes("🔎") && (
-                                    <div className="flex gap-1">
-                                        <div className="w-2 h-2 bg-[#8ab4f8] rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                                        <div className="w-2 h-2 bg-[#8ab4f8] rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                                        <div className="w-2 h-2 bg-[#8ab4f8] rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
-                                    </div>
-                                )}
+                        <div className="flex justify-center my-6 message-enter">
+                            <div className="inline-flex items-center gap-4 px-5 py-2.5 bg-black/40 border border-violet-500/20 rounded-full backdrop-blur-md shadow-[0_0_20px_rgba(139,92,246,0.15)] relative overflow-hidden">
+                                <div className="absolute inset-0 bg-gradient-to-r from-violet-500/5 via-cyan-500/5 to-violet-500/5 animate-[pulse_3s_infinite]"></div>
+                                <div className="flex gap-1.5 relative z-10">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-[bounce_1s_infinite_0ms] shadow-[0_0_8px_rgba(139,92,246,0.8)]"></span>
+                                    <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-[bounce_1s_infinite_150ms] shadow-[0_0_8px_rgba(139,92,246,0.8)]"></span>
+                                    <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-[bounce_1s_infinite_300ms] shadow-[0_0_8px_rgba(139,92,246,0.8)]"></span>
+                                </div>
+                                <span className="text-xs font-mono text-violet-300 tracking-wide uppercase relative z-10 text-glow">{status}</span>
+                                <button
+                                    onClick={handleStop}
+                                    className="ml-2 hover:bg-white/10 rounded-full p-1 transition-colors relative z-10 group"
+                                >
+                                    <StopCircle size={14} className="text-red-400/80 group-hover:text-red-400 transition-colors" />
+                                </button>
                             </div>
-                            <span className="text-sm">{status}</span>
-                            <button
-                                onClick={handleStop}
-                                className="ml-auto p-1 hover:bg-[#3c4043] rounded transition-colors"
-                                title="Stop generating"
-                            >
-                                <StopCircle size={18} className="text-red-400" />
-                            </button>
-                        </div>
-                    )}
-
-                    {/* Regenerate button */}
-                    {!isLoading && messages.length > 0 && messages[messages.length - 1]?.role === "assistant" && (
-                        <div className="flex justify-center">
-                            <button
-                                onClick={handleRegenerate}
-                                className="flex items-center gap-2 px-3 py-1.5 text-sm text-[#9aa0a6] hover:text-white hover:bg-[#2f2f2f] rounded-lg transition-colors"
-                            >
-                                <RefreshCw size={14} />
-                                Regenerate response
-                            </button>
                         </div>
                     )}
 
                     {/* Error message */}
                     {error && (
-                        <div className="flex items-center gap-2 text-red-400 bg-red-400/10 p-4 rounded-xl">
+                        <div className="flex items-center justify-center gap-2 text-red-300 bg-red-950/30 border border-red-500/20 p-4 rounded-xl mx-auto max-w-md backdrop-blur-md shadow-lg shadow-red-900/10 animate-in">
                             <AlertCircle size={18} />
-                            <span>{error}</span>
+                            <span className="text-sm font-medium">{error}</span>
                         </div>
                     )}
 
-                    <div ref={messagesEndRef} />
+                    {/* Spacer for bottom input */}
+                    <div ref={messagesEndRef} className="h-4" />
                 </div>
             </div>
 
             {/* Input Area */}
-            <InputArea
-                value={input}
-                onChange={setInput}
-                onSubmit={onSubmit}
-                isLoading={isLoading}
-            />
+            <div className="relative z-20">
+                <InputArea
+                    value={input}
+                    onChange={setInput}
+                    onSubmit={onSubmit}
+                    isLoading={isLoading}
+                />
+            </div>
         </div>
     );
 }

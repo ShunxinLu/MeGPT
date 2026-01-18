@@ -59,45 +59,54 @@ export default function MemoryManager() {
     );
 
     return (
-        <div className="min-h-screen bg-[#1e1e1e] text-white">
+        <div className="h-screen overflow-y-auto bg-void text-white relative">
+            {/* Background Texture */}
+            <div className="fixed inset-0 bg-noise opacity-[0.03] pointer-events-none"></div>
+
             {/* Header */}
-            <div className="border-b border-[#3c4043] p-4">
+            <div className="sticky top-0 z-10 border-b border-white/5 bg-black/80 backdrop-blur-xl p-4">
                 <div className="max-w-4xl mx-auto flex items-center gap-4">
                     <Link
                         href="/"
-                        className="p-2 hover:bg-[#2f2f2f] rounded-lg transition-colors"
+                        className="p-2 hover:bg-white/10 rounded-lg transition-colors text-zinc-400 hover:text-white"
                     >
                         <ArrowLeft size={20} />
                     </Link>
-                    <div className="flex items-center gap-2">
-                        <Brain className="text-purple-400" size={24} />
-                        <h1 className="text-xl font-semibold">Memory Manager</h1>
+                    <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg bg-violet-500/10">
+                            <Brain className="text-violet-400" size={20} />
+                        </div>
+                        <h1 className="text-xl font-bold font-sans tracking-tight">Memory Manager</h1>
                     </div>
                 </div>
             </div>
 
             {/* Content */}
-            <div className="max-w-4xl mx-auto p-6">
+            <div className="max-w-4xl mx-auto p-6 pb-20">
                 {/* Description */}
-                <p className="text-[#9aa0a6] mb-6">
-                    Manage what MeGPT remembers about you. Delete specific memories without removing entire conversations.
-                </p>
+                <div className="bg-white/5 border border-white/10 rounded-2xl p-6 mb-8 backdrop-blur-sm">
+                    <h2 className="text-lg font-semibold mb-2">Neural Long-term Storage</h2>
+                    <p className="text-zinc-400 leading-relaxed">
+                        Manage what MeGPT remembers about you. These memories persistent across all conversations.
+                        Deleting a memory here removes it permanently from the semantic search index.
+                    </p>
+                </div>
 
                 {/* Search */}
-                <div className="relative mb-6">
-                    <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#9aa0a6]" />
+                <div className="relative mb-8 group">
+                    <Search size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500 group-focus-within:text-violet-400 transition-colors" />
                     <input
                         type="text"
-                        placeholder="Filter memories..."
+                        placeholder="Search neural patterns..."
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
-                        className="w-full pl-10 pr-4 py-3 bg-[#0f0f0f] border border-[#3c4043] rounded-xl focus:outline-none focus:border-[#8ab4f8] text-white placeholder-[#9aa0a6]"
+                        className="w-full pl-11 pr-4 py-4 bg-black/40 border border-white/10 rounded-xl focus:outline-none focus:border-violet-500/50 focus:bg-black/60 text-white placeholder-zinc-600 transition-all font-sans shadow-lg"
                     />
                 </div>
 
                 {/* Error */}
                 {error && (
-                    <div className="flex items-center gap-2 text-red-400 bg-red-400/10 p-4 rounded-xl mb-6">
+                    <div className="flex items-center gap-2 text-red-300 bg-red-500/10 border border-red-500/20 p-4 rounded-xl mb-6">
                         <AlertCircle size={18} />
                         <span>{error}</span>
                     </div>
@@ -105,41 +114,44 @@ export default function MemoryManager() {
 
                 {/* Loading */}
                 {isLoading ? (
-                    <div className="text-center py-12 text-[#9aa0a6]">
-                        Loading memories...
+                    <div className="text-center py-20">
+                        <div className="w-8 h-8 border-2 border-violet-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                        <p className="text-zinc-500 font-mono text-sm animate-pulse">Syncing with vector database...</p>
                     </div>
                 ) : filteredMemories.length === 0 ? (
-                    <div className="text-center py-12 text-[#9aa0a6]">
-                        {searchQuery ? "No memories match your search" : "No memories stored yet"}
+                    <div className="text-center py-20 rounded-3xl border border-dashed border-white/10 bg-white/[0.02]">
+                        <Brain size={48} className="mx-auto text-zinc-700 mb-4" />
+                        <p className="text-zinc-500">{searchQuery ? "No matching memories found" : "Neural network is empty"}</p>
                     </div>
                 ) : (
-                    <div className="space-y-3">
-                        <p className="text-sm text-[#9aa0a6] mb-4">
-                            {filteredMemories.length} memorie{filteredMemories.length !== 1 ? "s" : ""} stored
-                        </p>
+                    <div className="space-y-4">
+                        <div className="flex items-center justify-between px-2 text-xs font-medium uppercase tracking-wider text-zinc-500 font-mono">
+                            <span>Detected Patterns</span>
+                            <span>{filteredMemories.length} entries</span>
+                        </div>
                         {filteredMemories.map((memory) => (
                             <div
                                 key={memory.id}
-                                className="group flex items-start gap-4 p-4 bg-[#0f0f0f] border border-[#3c4043] rounded-xl hover:border-[#8ab4f8]/50 transition-colors"
+                                className="group flex items-start gap-4 p-5 bg-white/[0.03] border border-white/5 rounded-2xl hover:border-violet-500/30 hover:bg-white/[0.05] transition-all duration-300 hover:shadow-lg hover:shadow-black/20"
                             >
                                 <div className="flex-1">
-                                    <p className="text-white">{memory.memory}</p>
+                                    <p className="text-zinc-200 leading-relaxed font-sans">{memory.memory}</p>
                                     {memory.created_at && (
-                                        <p className="text-xs text-[#9aa0a6] mt-2">
-                                            {new Date(memory.created_at).toLocaleDateString()}
+                                        <p className="text-xs text-zinc-600 mt-2 font-mono">
+                                            {new Date(memory.created_at).toLocaleDateString()} • ID: {memory.id.substring(0, 8)}
                                         </p>
                                     )}
                                 </div>
                                 <button
                                     onClick={() => deleteMemory(memory.id)}
                                     disabled={deletingId === memory.id}
-                                    className="opacity-0 group-hover:opacity-100 p-2 hover:bg-red-500/20 rounded-lg transition-all text-red-400"
-                                    title="Delete this memory"
+                                    className="opacity-0 group-hover:opacity-100 p-2.5 rounded-xl hover:bg-red-500/10 text-zinc-500 hover:text-red-400 transition-all scale-95 group-hover:scale-100"
+                                    title="Delete from permanent memory"
                                 >
                                     {deletingId === memory.id ? (
                                         <div className="w-4 h-4 border-2 border-red-400 border-t-transparent rounded-full animate-spin" />
                                     ) : (
-                                        <Trash2 size={16} />
+                                        <Trash2 size={18} />
                                     )}
                                 </button>
                             </div>

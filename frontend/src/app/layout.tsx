@@ -1,15 +1,20 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { Outfit, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
-const inter = Inter({
+const outfit = Outfit({
   subsets: ["latin"],
-  variable: "--font-inter",
+  variable: "--font-outfit",
+});
+
+const jetbrainsMono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-mono",
 });
 
 export const metadata: Metadata = {
-  title: "MeGPT - Local Memory Agent",
-  description: "Privacy-first AI assistant with persistent memory",
+  title: "MeGPT | Second Brain",
+  description: "Advanced AI Assistant with Long-term Memory",
 };
 
 export default function RootLayout({
@@ -18,8 +23,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="dark" suppressHydrationWarning>
-      <body className={`${inter.variable} antialiased bg-[#0f0f0f] text-[#e8eaed]`} suppressHydrationWarning>
+    <html lang="en" className="dark">
+      <body className={`${outfit.variable} ${jetbrainsMono.variable} antialiased selection:bg-violet-500/30 selection:text-white`} suppressHydrationWarning>
         {children}
       </body>
     </html>
