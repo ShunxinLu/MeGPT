@@ -23,9 +23,14 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="dark">
+    <html lang="en" className="dark" suppressHydrationWarning>
       <body className={`${outfit.variable} ${jetbrainsMono.variable} antialiased selection:bg-violet-500/30 selection:text-white`} suppressHydrationWarning>
-        {children}
+        <a href="#main-content" className="skip-to-content">
+          Skip to main content
+        </a>
+        <div id="main-content">
+          {children}
+        </div>
       </body>
     </html>
   );

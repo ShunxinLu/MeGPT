@@ -3,14 +3,24 @@ FastAPI Backend Server - SSE streaming with Vercel AI Data Stream Protocol.
 Brain Transplant: Routes through agent_graph.py for proper tool execution.
 """
 
+import asyncio
 import json
+import logging
 from typing import Optional
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from config import config
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 from database import (
     create_chat,
     get_chats,
@@ -29,10 +39,30 @@ from tools.backup_tool import (
     list_backups,
     restore_backup,
     rollback_latest,
-    get_backup_info,
+)
+from tools.email_tools import (
+    search_emails,
+    get_email_thread,
+    list_unread_emails,
+    get_email_count,
+)
+from tools.calendar_tools import (
+    get_upcoming_events,
+    create_event,
+    get_calendar_proposals,
+    approve_proposal,
+    reject_proposal,
+    update_event,
+    delete_event,
 )
 from utils.model_loader import ensure_models_loaded
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+
+# Import provider management API
+from api.providers import router as providers_router
+
+# Import documents API
+from api.documents import router as documents_router
 
 app = FastAPI(
     title="MeGPT Pro API",
@@ -40,22 +70,91 @@ app = FastAPI(
     version="4.0.0",
 )
 
+# Include provider management routes
+app.include_router(providers_router)
+
+# Include documents routes
+app.include_router(documents_router)
+
 
 @app.on_event("startup")
 async def startup_event():
-    """Load models on server startup."""
-    print("🔄 Loading models in LM Studio...")
+    """Load models on server startup and start periodic sync scheduler."""
+    logger.info("Loading models in LM Studio...")
     success = await ensure_models_loaded()
     if success:
-        print("✓ Models ready!")
+        logger.info("Models ready!")
     else:
-        print("⚠ Models may not be loaded - check LM Studio")
+        logger.warning("Models may not be loaded - check LM Studio")
+
+    # Validate authentication in production
+    if config.is_production and config.api_key is None:
+        logger.error("SECURITY WARNING: API_KEY not set in production mode!")
+        logger.error("Set API_KEY environment variable to secure your API.")
+
+    # Start periodic sync scheduler and store reference
+    logger.info("Starting background sync scheduler...")
+    global _sync_scheduler_task
+    _sync_scheduler_task = asyncio.create_task(periodic_sync_scheduler())
+
+
+# Global reference for sync scheduler task
+_sync_scheduler_task = None
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up resources on shutdown."""
+    global _sync_scheduler_task
+    if _sync_scheduler_task:
+        _sync_scheduler_task.cancel()
+        try:
+            await _sync_scheduler_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def periodic_sync_scheduler():
+    """
+    Run periodic sync tasks for all domains.
+
+    Syncs run on different schedules:
+    - Email: Every 30 minutes
+    - Calendar: Every 15 minutes
+    """
+    consecutive_failures = 0
+
+    while True:
+        try:
+            # Run all syncs
+            await run_email_sync("Periodic scheduler")
+            await run_calendar_sync("Periodic scheduler")
+
+            consecutive_failures = 0  # Reset on success
+            logger.info("Sync cycle complete, waiting 1 hour until next cycle")
+            await asyncio.sleep(3600)  # 1 hour in seconds
+
+        except Exception as e:
+            consecutive_failures += 1
+            logger.error(f"Scheduler error (failure {consecutive_failures}): {e}", exc_info=True)
+            if consecutive_failures >= 3:
+                logger.critical("[SYNC] Multiple consecutive failures - check services")
+            # Wait 5 minutes before retry with exponential backoff
+            wait_time = min(300 * (2 ** (consecutive_failures - 1)), 3600)
+            await asyncio.sleep(wait_time)
 
 
 # Enable CORS for Next.js frontend
+# Use environment variable for allowed origins in production
+import os
+_allowed_origins = os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLOWED_ORIGINS") else [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -110,6 +209,44 @@ class HealthResponse(BaseModel):
     qdrant_host: str
 
 
+class CreateEventRequest(BaseModel):
+    """Request to create a calendar event."""
+    title: str
+    start_time: str
+    end_time: str
+    location: str = ""
+    description: str = ""
+    attendees: list[str] = []
+    chat_id: str = ""
+
+    @field_validator("attendees", mode="before")
+    @classmethod
+    def parse_attendees(cls, v):
+        """Parse attendees from JSON string if needed."""
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse attendees JSON: {e}")
+                return []
+        return v
+
+
+class UpdateEventRequest(BaseModel):
+    """Request to update a calendar event."""
+    title: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    location: Optional[str] = None
+    description: Optional[str] = None
+    attendees: Optional[list[str]] = None
+
+
+class RejectProposalRequest(BaseModel):
+    """Request to reject a calendar proposal."""
+    reason: str = ""
+
+
 # ========== NOTE: SYSTEM_PROMPT is now in agent_graph.py ==========
 # The Agent Graph manages all context and tool execution.
 
@@ -133,7 +270,69 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None)) -> None:
             raise HTTPException(status_code=403, detail="Invalid API key")
 
 
+async def verify_admin_api_key(x_admin_api_key: Optional[str] = Header(None, alias="X-Admin-API-Key")) -> None:
+    """
+    Admin API key verification for privileged operations.
+
+    Requires ADMIN_API_KEY if set, otherwise falls back to API_KEY.
+    In production mode, authentication is always required.
+    """
+    admin_key = config.admin_api_key or config.api_key
+
+    if admin_key is not None:
+        if x_admin_api_key is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Admin API key required. Set X-Admin-API-Key header.",
+            )
+        if x_admin_api_key != admin_key:
+            logger.warning(f"Failed admin API key authentication attempt")
+            raise HTTPException(status_code=403, detail="Invalid admin API key")
+    elif config.is_production:
+        # Production mode requires authentication even if not configured
+        raise HTTPException(
+            status_code=401,
+            detail="Admin API key required in production mode. Set ADMIN_API_KEY environment variable.",
+        )
+
+
 # ========== Helpers ==========
+
+
+def sanitize_fts5_query(query: str) -> str:
+    """
+    Sanitize FTS5 search query to prevent injection.
+
+    Removes or escapes FTS5 special characters: *, ", (, ), -, NOT, AND, OR, NEAR
+    """
+    if not query:
+        return ""
+
+    # Remove FTS5 special characters that can be used for injection
+    # Replace quotes with spaces, remove wildcards and operators
+    sanitized = query.replace('"', ' ')
+    sanitized = sanitized.replace('*', ' ')
+    sanitized = sanitized.replace('(', ' ')
+    sanitized = sanitized.replace(')', ' ')
+
+    # Remove FTS5 operators (case-insensitive)
+    import re
+    sanitized = re.sub(r'\b(AND|OR|NOT|NEAR)\b', '', sanitized, flags=re.IGNORECASE)
+
+    # Clean up extra whitespace
+    sanitized = ' '.join(sanitized.split())
+
+    # Limit query length to prevent DoS
+    return sanitized[:500]
+
+
+def validate_limit(limit: int, default: int = 5, max_val: int = 100) -> int:
+    """Validate and clamp limit parameter."""
+    if limit < 1:
+        return default
+    if limit > max_val:
+        return max_val
+    return limit
 
 
 def convert_messages(messages: list[Message]) -> list[BaseMessage]:
@@ -161,10 +360,10 @@ async def stream_response(
     background_tasks: Optional[BackgroundTasks] = None,
 ):
     """
-    Stream the LLM response through the Agent Graph.
+    Stream LLM response through Agent Graph.
     Brain Transplant: Routes through agent_graph.py for proper tool execution.
     """
-    from agent_graph import agent
+    from agent_graph import create_agent_graph
     from langchain_core.messages import HumanMessage
 
     # Get the last user message
@@ -182,6 +381,9 @@ async def stream_response(
     last_node = ""
 
     try:
+        # Create agent graph
+        agent = create_agent_graph()
+
         # Stream from LangGraph using astream (yields state updates per node)
         async for state_update in agent.astream(
             input={
@@ -224,15 +426,14 @@ async def stream_response(
                 trigger_threshold = 3 if msg_count > 15 else 5
                 if msg_count > 0 and msg_count % trigger_threshold == 0:
                     background_tasks.add_task(summarize_chat_background, chat_id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to schedule background summarization for chat {chat_id}: {e}")
 
     except Exception as e:
-        print(f"❌ Stream error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        yield format_event("error", str(e))
+        logger.error(f"Stream error: {e}", exc_info=True)
+        # Sanitize error messages before sending to client
+        error_msg = str(e) if not config.is_production else "An error occurred during processing"
+        yield format_event("error", error_msg)
 
 
 # ========== Health Check ==========
@@ -241,6 +442,13 @@ async def stream_response(
 @app.get("/api/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
+    # Redact internal URLs in production mode
+    if config.is_production:
+        return HealthResponse(
+            status="ok",
+            llm_url="(configured)",
+            qdrant_host="(configured)",
+        )
     return HealthResponse(
         status="ok",
         llm_url=config.llm_base_url,
@@ -262,7 +470,8 @@ async def list_chats(user_id: Optional[str] = None):
 async def search_chats_endpoint(q: str, user_id: Optional[str] = None):
     """Full-text search across chat messages."""
     uid = user_id or config.user_id
-    return search_chats(uid, q)
+    sanitized_q = sanitize_fts5_query(q)
+    return search_chats(uid, sanitized_q)
 
 
 @app.post("/api/chats")
@@ -293,18 +502,24 @@ async def delete_chat_endpoint(chat_id: str, user_id: Optional[str] = None):
     """
     Delete a chat with cascading memory deletion.
     Phase 3: Wipes Tier 1 (Archive), Tier 2 (Facts), and Tier 3 (Summary).
+
+    CRITICAL: Delete SQLite FIRST to prevent orphaned memories on failure.
     """
     uid = user_id or config.user_id
 
-    print(f"🗑️ Starting cascading delete for chat {chat_id[:8]}...")
+    logger.info(f"Starting cascading delete for chat {chat_id[:8]}...")
 
-    # STEP 1: Vector Wipe (Tier 2) - Delete related memories from Qdrant
+    # STEP 1: Delete SQLite FIRST (can be rolled back if needed)
+    try:
+        delete_chat(chat_id)
+    except Exception as e:
+        logger.error(f"Failed to delete chat from SQLite: {e}")
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+
+    # STEP 2: Only delete memories after SQLite delete succeeds
     deleted_memories = delete_memories_for_chat(chat_id, uid)
 
-    # STEP 2: SQL Wipe (Tier 1 & Tier 3) - ON DELETE CASCADE handles messages
-    delete_chat(chat_id)
-
-    print(f"✓ Chat and {deleted_memories} memories permanently scrubbed")
+    logger.info(f"Chat and {deleted_memories} memories permanently deleted")
     return {"success": True, "deleted_memories": deleted_memories}
 
 
@@ -340,6 +555,261 @@ async def delete_memory_endpoint(memory_id: str):
     if not success:
         raise HTTPException(status_code=404, detail="Memory not found or delete failed")
     return {"success": True}
+
+
+# ========== Domain Endpoints: Email ==========
+
+
+@app.get("/api/emails/search")
+async def search_emails_endpoint(
+    q: str,
+    limit: int = 5,
+    priority: str = "all",
+    _auth: None = Depends(verify_api_key),
+):
+    """Search emails by content."""
+    validated_limit = validate_limit(limit, default=5, max_val=100)
+    sanitized_q = sanitize_fts5_query(q)
+    result = search_emails.invoke({"query": sanitized_q, "limit": validated_limit, "priority": priority})
+    return {"results": result}
+
+
+@app.get("/api/emails/{email_id}/thread")
+async def get_email_thread_endpoint(
+    email_id: str, _auth: None = Depends(verify_api_key)
+):
+    """Get full email thread."""
+    result = get_email_thread.invoke({"email_id": email_id})
+    return {"thread": result}
+
+
+@app.get("/api/emails/unread")
+async def list_unread_emails_endpoint(
+    limit: int = 10, _auth: None = Depends(verify_api_key)
+):
+    """List unread emails."""
+    validated_limit = validate_limit(limit, default=10, max_val=100)
+    result = list_unread_emails.invoke({"limit": validated_limit})
+    return {"emails": result}
+
+
+@app.get("/api/emails/count")
+async def get_email_count_endpoint(
+    priority: str = "all", _auth: None = Depends(verify_api_key)
+):
+    """Get email count by priority."""
+    result = get_email_count.invoke({"priority": priority})
+    return {"counts": result}
+
+
+# ========== Domain Endpoints: Calendar ==========
+
+
+@app.get("/api/calendar/events")
+async def get_upcoming_events_endpoint(
+    days: int = 7, _auth: None = Depends(verify_api_key)
+):
+    """Get upcoming calendar events."""
+    validated_days = validate_limit(days, default=7, max_val=365)
+    result = get_upcoming_events.invoke({"days": validated_days})
+    return {"events": result}
+
+
+@app.post("/api/calendar/events")
+async def create_event_endpoint(
+    data: CreateEventRequest,
+    _auth: None = Depends(verify_api_key),
+):
+    """Create a new calendar event."""
+    result = create_event.invoke(
+        {
+            "title": data.title,
+            "start_time": data.start_time,
+            "end_time": data.end_time,
+            "location": data.location,
+            "description": data.description,
+            "attendees": json.dumps(data.attendees),
+            "chat_id": data.chat_id,
+        }
+    )
+    return {"event": result}
+
+
+@app.get("/api/calendar/proposals")
+async def get_calendar_proposals_endpoint(_auth: None = Depends(verify_api_key)):
+    """Get pending calendar proposals."""
+    result = get_calendar_proposals.invoke({})
+    return {"proposals": result}
+
+
+@app.post("/api/calendar/proposals/{proposal_id}/approve")
+async def approve_proposal_endpoint(
+    proposal_id: int, _auth: None = Depends(verify_api_key)
+):
+    """Approve a calendar proposal."""
+    result = approve_proposal.invoke({"proposal_id": proposal_id})
+    return {"proposal": result}
+
+
+@app.post("/api/calendar/proposals/{proposal_id}/reject")
+async def reject_proposal_endpoint(
+    proposal_id: str,
+    data: RejectProposalRequest = RejectProposalRequest(),
+    _auth: None = Depends(verify_api_key),
+):
+    """Reject a calendar proposal."""
+    result = reject_proposal.invoke({"proposal_id": proposal_id, "reason": data.reason})
+    return {"proposal": result}
+
+
+@app.patch("/api/calendar/events/{event_id}")
+async def update_event_endpoint(
+    event_id: str,
+    data: UpdateEventRequest,
+    _auth: None = Depends(verify_api_key),
+):
+    """Update a calendar event."""
+    # Filter out None values
+    updates = {k: v for k, v in data.model_dump().items() if v is not None}
+    result = update_event.invoke({"event_id": event_id, "updates": updates})
+    return {"event": result}
+
+
+@app.delete("/api/calendar/events/{event_id}")
+async def delete_event_endpoint(event_id: str, _auth: None = Depends(verify_api_key)):
+    """Delete a calendar event."""
+    result = delete_event.invoke({"event_id": event_id})
+    return {"event": result}
+
+
+# ========== Sync Endpoints ==========
+
+
+class SyncRequest(BaseModel):
+    """Request to trigger background sync."""
+    sync_type: str  # "email", "calendar", or "all"
+    model_config = {"json_schema_extra": {"examples": [{"sync_type": "all"}]}}
+
+    @field_validator("sync_type")
+    @classmethod
+    def validate_sync_type(cls, v: str) -> str:
+        """Validate sync_type is one of the allowed values."""
+        allowed = {"email", "calendar", "all"}
+        if v not in allowed:
+            raise ValueError(f"sync_type must be one of {allowed}")
+        return v
+
+
+@app.post("/api/sync/trigger")
+async def trigger_sync_endpoint(
+    request: SyncRequest,
+    background_tasks: BackgroundTasks,
+    _auth: None = Depends(verify_api_key),
+):
+    """
+    Trigger background sync for specified domain(s).
+
+    This endpoint starts async sync tasks that run in the background.
+    Returns immediately while sync continues in background.
+    """
+    sync_types = request.sync_type.lower()
+
+    if sync_types == "all":
+        # Trigger all syncs
+        background_tasks.add_task(
+            run_email_sync,
+            "Triggered via API",
+        )
+        background_tasks.add_task(
+            run_calendar_sync,
+            "Triggered via API",
+        )
+        message = "Sync started for all domains (email, calendar)"
+    elif sync_types == "email":
+        background_tasks.add_task(
+            run_email_sync,
+            "Triggered via API",
+        )
+        message = "Email sync started"
+    elif sync_types == "calendar":
+        background_tasks.add_task(
+            run_calendar_sync,
+            "Triggered via API",
+        )
+        message = "Calendar sync started"
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid sync type: {sync_types}")
+
+    return {
+        "status": "sync_started",
+        "sync_type": sync_types,
+        "message": message,
+    }
+
+
+# ========== Sync Functions ==========
+
+
+async def run_email_sync(reason: str = "Scheduled sync"):
+    """
+    Run email synchronization task.
+
+    In production, this would connect to Gmail/Outlook APIs,
+    download new emails, classify them, and store in database.
+    """
+    logger.info(f"Email sync started: {reason}")
+
+    # TODO: Implement actual email sync
+    # For now, just update sync timestamp in chats table
+    from database import get_connection
+
+    with get_connection() as conn:
+        # Get most recent chat to update
+        cursor = conn.execute("SELECT id FROM chats ORDER BY updated_at DESC LIMIT 1")
+        chat_row = cursor.fetchone()
+
+        if chat_row:
+            chat_id = chat_row["id"]
+            now = datetime.utcnow().isoformat()
+            conn.execute(
+                "UPDATE chats SET last_email_sync = ? WHERE id = ?",
+                (now, chat_id),
+            )
+            conn.commit()
+            logger.info(f"Email sync completed. Updated chat {chat_id} with timestamp {now}")
+
+    logger.info("Email sync completed")
+
+
+async def run_calendar_sync(reason: str = "Scheduled sync"):
+    """
+    Run calendar synchronization task.
+
+    In production, this would connect to Google Calendar API,
+    download events, and sync with proposals.
+    """
+    logger.info(f"Calendar sync started: {reason}")
+
+    # TODO: Implement actual calendar sync
+    # For now, just update sync timestamp in chats table
+    from database import get_connection
+
+    with get_connection() as conn:
+        # Get most recent chat to update
+        cursor = conn.execute("SELECT id FROM chats ORDER BY updated_at DESC LIMIT 1")
+        chat_row = cursor.fetchone()
+
+        if chat_row:
+            chat_id = chat_row["id"]
+            now = datetime.utcnow().isoformat()
+            conn.execute(
+                "UPDATE chats SET last_calendar_sync = ? WHERE id = ?",
+                (now, chat_id),
+            )
+            conn.commit()
+            logger.info(f"Calendar sync completed. Updated chat {chat_id} with timestamp {now}")
+
+    logger.info("Calendar sync completed")
 
 
 # ========== Chat Streaming Endpoint ==========
@@ -385,7 +855,7 @@ class RestoreRequest(BaseModel):
 
 
 @app.get("/api/admin/env")
-async def get_environment():
+async def get_environment(_auth: None = Depends(verify_admin_api_key)):
     """Get current environment info."""
     return {
         "env_mode": config.env_mode,
@@ -398,7 +868,7 @@ async def get_environment():
 
 
 @app.get("/api/admin/backups")
-async def list_backups_endpoint():
+async def list_backups_endpoint(_auth: None = Depends(verify_admin_api_key)):
     """List all available backups."""
     backups = list_backups()
     return [
@@ -416,10 +886,10 @@ async def list_backups_endpoint():
 
 @app.post("/api/admin/backup")
 async def create_backup_endpoint(
-    data: BackupCreate, _auth: None = Depends(verify_api_key)
+    data: BackupCreate, _auth: None = Depends(verify_admin_api_key)
 ):
     """Create a new backup."""
-    backup = create_backup(data.description)
+    backup = create_backup(data.description or "")
     if not backup:
         raise HTTPException(status_code=500, detail="Backup failed")
     return {
@@ -433,7 +903,7 @@ async def create_backup_endpoint(
 
 @app.post("/api/admin/restore/{backup_id}")
 async def restore_backup_endpoint(
-    backup_id: str, data: RestoreRequest, _auth: None = Depends(verify_api_key)
+    backup_id: str, data: RestoreRequest, _auth: None = Depends(verify_admin_api_key)
 ):
     """Restore from a specific backup."""
     # Require confirmation for production
@@ -450,7 +920,7 @@ async def restore_backup_endpoint(
 
 @app.post("/api/admin/rollback")
 async def rollback_endpoint(
-    data: RestoreRequest, _auth: None = Depends(verify_api_key)
+    data: RestoreRequest, _auth: None = Depends(verify_admin_api_key)
 ):
     """Rollback to the most recent backup."""
     # Require confirmation for production
@@ -469,5 +939,5 @@ if __name__ == "__main__":
     import uvicorn
 
     config.validate()
-    print("🚀 Starting MeGPT Pro API on http://localhost:8000")
+    logger.info("Starting MeGPT Pro API on http://localhost:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)

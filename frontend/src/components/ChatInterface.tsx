@@ -4,6 +4,8 @@ import { useState, useRef, useEffect } from "react";
 import { AlertCircle, StopCircle, RefreshCw, Brain, Search, Sparkles, Terminal } from "lucide-react";
 import MessageBubble from "./MessageBubble";
 import InputArea from "./InputArea";
+import ToastContainer from "./Toast";
+import type { Toast } from "./Toast";
 
 interface Message {
     id: string;
@@ -32,6 +34,7 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
     const [status, setStatus] = useState<string>("");
     const [currentChatId, setCurrentChatId] = useState<string | null>(chatId);
     const [lastUserMessage, setLastUserMessage] = useState<string>("");
+    const [toasts, setToasts] = useState<Toast[]>([]);
 
     // Load messages when chat changes
     useEffect(() => {
@@ -182,18 +185,23 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
                 fullText += textContent;
 
                 setMessages(prev => {
-                    const newMessages = [...prev];
-                    const lastMsg = newMessages[newMessages.length - 1];
+                    const lastMsg = prev[prev.length - 1];
                     if (lastMsg?.role === "assistant") {
-                        lastMsg.content = fullText;
+                        // Create new object instead of mutating
+                        return [
+                            ...prev.slice(0, -1),
+                            { ...lastMsg, content: fullText }
+                        ];
                     } else {
-                        newMessages.push({
-                            id: (Date.now() + 1).toString(),
-                            role: "assistant",
-                            content: fullText,
-                        });
+                        return [
+                            ...prev,
+                            {
+                                id: (Date.now() + 1).toString(),
+                                role: "assistant",
+                                content: fullText,
+                            },
+                        ];
                     }
-                    return [...newMessages];
                 });
             }
 
@@ -331,8 +339,21 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
                     onChange={setInput}
                     onSubmit={onSubmit}
                     isLoading={isLoading}
+                    onStop={handleStop}
+                    chatId={currentChatId ?? undefined}
+                    onFileUploaded={(doc) => {
+                        // Add system message about uploaded document
+                        setMessages(prev => [...prev, {
+                            id: Date.now().toString(),
+                            role: "assistant",
+                            content: `📄 Document "${doc.filename}" uploaded and processed. You can now ask questions about its contents.`
+                        }]);
+                    }}
                 />
             </div>
+
+            {/* Toast Container */}
+            <ToastContainer toasts={toasts} onRemove={(id) => setToasts(prev => prev.filter(t => t.id !== id))} />
         </div>
     );
 }

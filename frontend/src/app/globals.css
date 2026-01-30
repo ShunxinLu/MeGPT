@@ -40,10 +40,49 @@
 @theme inline {
   --font-sans: var(--font-outfit);
   --font-mono: var(--font-mono);
-
+  
+  /* Theme Colors - Unified Assistant */
   --color-void: var(--bg-void);
   --color-glass: var(--bg-panel);
-  --color-border-glass: var(--border-glass);
+  --border-glass: rgba(255, 255, 255, 0.08);
+  --border-glass-highlight: rgba(255, 255, 255, 0.15);
+  
+  /* Domain Colors */
+  --domain-chat: #8b5cf6;
+  --domain-email: #8b5cf6;
+  --domain-calendar: #06b6d4;
+  --domain-finance: #06b6d4;
+  --domain-settings: #6b7280;
+  
+  /* Accent Colors */
+  --accent-primary: #8b5cf6;
+  --accent-secondary: #06b6d4;
+  --accent-tertiary: #ec4899;
+  --accent-cyan: #06d9ee;
+  --accent-pink: #d946ef;
+  
+  /* Text Colors - Enhanced Contrast */
+  --text-primary: #f4f4f5;
+  --text-secondary: #a1a1aa;
+  --text-tertiary: #52525b;
+  
+  /* Status Colors */
+  --status-success: #10b981;
+  --status-warning: #f59e0b;
+  --status-error: #ef4444;
+  --status-info: #0ea5e9;
+  
+  /* Glassmorphism - Cleaner */
+  --glass-surface-light: rgba(255, 255, 255, 0.7);
+  --glass-surface-dark: rgba(0, 0, 0, 0.3);
+  --glass-border-light: rgba(255, 255, 255, 0.12);
+  --glass-border-dark: rgba(255, 255, 255, 0.06);
+  --glass-shadow-light: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+  --glass-shadow-dark: 0 4px 10px -2px rgba(0, 0, 0, 0.25);
+  
+  /* Effects */
+  --glass-blur: blur(20px);
+  --glass-saturate: saturate(150%);
 }
 
 * {
@@ -182,4 +221,67 @@ body {
   background-clip: text;
   color: transparent;
   text-shadow: 0 0 30px rgba(167, 139, 250, 0.3);
+}
+
+/* --- Accessibility: Focus Visible --- */
+/* Focus styles for keyboard navigation (only show when using keyboard, not mouse) */
+*:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Remove default outline for mouse users */
+*:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* High contrast focus indicators for better visibility */
+.focus-visible-ring {
+  box-shadow: 0 0 0 2px var(--bg-void), 0 0 0 4px var(--accent-primary);
+}
+
+/* Skip to content link for accessibility */
+.skip-to-content {
+  position: absolute;
+  left: -9999px;
+  z-index: 999;
+  padding: 1rem 2rem;
+  background: var(--accent-primary);
+  color: white;
+  text-decoration: none;
+  border-radius: 0 0 8px 0;
+}
+
+.skip-to-content:focus {
+  left: 0;
+  top: 0;
+}
+
+/* Reduced motion for users who prefer it */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Higher contrast for better readability */
+@media (prefers-contrast: high) {
+  .glass {
+    background: rgba(18, 18, 20, 0.95);
+    border: 2px solid rgba(255, 255, 255, 0.2);
+  }
 }

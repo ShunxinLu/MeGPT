@@ -4,6 +4,7 @@ Phase 4: Data protection for SQLite and Qdrant.
 """
 
 import json
+import logging
 import shutil
 import sqlite3
 from datetime import datetime
@@ -12,6 +13,8 @@ from typing import Optional
 from dataclasses import dataclass, asdict
 
 from config import config
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -107,7 +110,7 @@ def _export_qdrant_vectors(output_path: Path) -> bool:
         output_path.write_text(json.dumps(all_points, indent=2))
         return True
     except Exception as e:
-        print(f"⚠ Vector export failed: {e}")
+        logger.error(f"Vector export failed: {e}")
         return False
 
 
@@ -128,8 +131,9 @@ def _import_qdrant_vectors(input_path: Path) -> bool:
         # Recreate collection (drop if exists)
         try:
             client.delete_collection(config.qdrant_collection)
-        except Exception:
-            pass
+            logger.info(f"Deleted existing collection for restore")
+        except Exception as e:
+            logger.warning(f"Collection delete failed (may not exist): {e}")
 
         # Detect embedding dimension from first point
         embedding_dim = 768
@@ -137,7 +141,7 @@ def _import_qdrant_vectors(input_path: Path) -> bool:
             first_vector = points_data[0].get("vector")
             if first_vector:
                 embedding_dim = len(first_vector)
-                print(f"✓ Detected embedding dimension: {embedding_dim}")
+                logger.info(f"Detected embedding dimension: {embedding_dim}")
 
         client.create_collection(
             collection_name=config.qdrant_collection,
@@ -157,7 +161,7 @@ def _import_qdrant_vectors(input_path: Path) -> bool:
 
         return True
     except Exception as e:
-        print(f"⚠ Vector import failed: {e}")
+        logger.error(f"Vector import failed: {e}")
         return False
 
 
@@ -171,6 +175,7 @@ def create_backup(description: str = "") -> Optional[BackupInfo]:
     Returns:
         BackupInfo if successful, None otherwise
     """
+    conn = None
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_id = f"{timestamp}_{config.env_mode}"
@@ -178,17 +183,26 @@ def create_backup(description: str = "") -> Optional[BackupInfo]:
         # Ensure backup directory exists
         config.backups_dir.mkdir(parents=True, exist_ok=True)
 
-        # Backup SQLite (with WAL checkpoint first)
+        # Backup SQLite (with WAL checkpoint while holding lock)
         db_backup_name = f"{backup_id}_megpt.db"
         db_backup_path = config.backups_dir / db_backup_name
 
         if config.db_path.exists():
-            # Checkpoint WAL to ensure all data is in main file
+            # Open connection and keep it open during copy
             conn = sqlite3.connect(config.db_path)
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            conn.close()
+            conn.execute("BEGIN IMMEDIATE")  # Lock database
 
-            shutil.copy2(config.db_path, db_backup_path)
+            try:
+                # Checkpoint WAL to ensure all data is in main file
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+                # Copy WHILE holding lock
+                shutil.copy2(config.db_path, db_backup_path)
+
+                conn.commit()
+            finally:
+                conn.close()
+                conn = None
 
         # Backup Qdrant vectors
         vectors_backup_name = f"{backup_id}_vectors.json"
@@ -229,13 +243,18 @@ def create_backup(description: str = "") -> Optional[BackupInfo]:
 
         _save_manifest(manifest)
 
-        print(f"✓ Backup created: {backup_id}")
-        print(f"  Chats: {chat_count}, Messages: {msg_count}, Memories: {memory_count}")
+        logger.info(f"Backup created: {backup_id}")
+        logger.info(f"  Chats: {chat_count}, Messages: {msg_count}, Memories: {memory_count}")
 
         return backup
 
     except Exception as e:
-        print(f"⚠ Backup failed: {e}")
+        logger.error(f"Backup failed: {e}")
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
         return None
 
 
@@ -260,33 +279,37 @@ def restore_backup(backup_id: str) -> bool:
         backup = next((b for b in manifest if b["id"] == backup_id), None)
 
         if not backup:
-            print(f"⚠ Backup not found: {backup_id}")
+            logger.warning(f"Backup not found: {backup_id}")
             return False
 
         # Auto-backup before restore (safety net)
         if config.auto_backup_before_restore:
-            print("📦 Creating safety backup before restore...")
+            logger.info("Creating safety backup before restore...")
             create_backup("auto_before_restore")
 
         # Restore SQLite
         db_backup_path = config.backups_dir / backup["db_file"]
         if db_backup_path.exists():
+            # Validate backup file before restore
+            if db_backup_path.stat().st_size == 0:
+                logger.error(f"Backup file is empty: {backup['db_file']}")
+                return False
             # Close any connections and replace file
             shutil.copy2(db_backup_path, config.db_path)
-            print(f"✓ Database restored from {backup['db_file']}")
+            logger.info(f"Database restored from {backup['db_file']}")
 
         # Restore Qdrant vectors
         if backup.get("vectors_file"):
             vectors_backup_path = config.backups_dir / backup["vectors_file"]
             if vectors_backup_path.exists():
                 _import_qdrant_vectors(vectors_backup_path)
-                print(f"✓ Vectors restored from {backup['vectors_file']}")
+                logger.info(f"Vectors restored from {backup['vectors_file']}")
 
-        print(f"✓ Restore complete: {backup_id}")
+        logger.info(f"Restore complete: {backup_id}")
         return True
 
     except Exception as e:
-        print(f"⚠ Restore failed: {e}")
+        logger.error(f"Restore failed: {e}")
         return False
 
 
@@ -300,12 +323,12 @@ def rollback_latest() -> bool:
     backups = list_backups()
 
     if not backups:
-        print("⚠ No backups available for rollback")
+        logger.warning("No backups available for rollback")
         return False
 
     # Skip the very first if it's an auto-backup we just created
     latest = backups[0]
-    print(f"🔄 Rolling back to: {latest.id}")
+    logger.info(f"Rolling back to: {latest.id}")
 
     return restore_backup(latest.id)
 

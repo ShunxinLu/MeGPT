@@ -102,7 +102,7 @@ export default function MessageBubble({ role, content, isStreaming }: MessageBub
                                             {/* Code Content */}
                                             <div className="relative">
                                                 <SyntaxHighlighter
-                                                    style={atomDark}
+                                                    style={atomDark as any}
                                                     language={match?.[1] || "text"}
                                                     PreTag="div"
                                                     customStyle={{
@@ -112,7 +112,6 @@ export default function MessageBubble({ role, content, isStreaming }: MessageBub
                                                         fontSize: "0.9rem",
                                                         lineHeight: "1.6",
                                                     }}
-                                                    {...props}
                                                 >
                                                     {codeString}
                                                 </SyntaxHighlighter>

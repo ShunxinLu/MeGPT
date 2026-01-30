@@ -3,12 +3,13 @@
  * Streams the response with Data Stream Protocol events
  */
 import { NextRequest } from "next/server";
+import { BACKEND_URL } from "@/lib/api";
 
 export async function POST(req: NextRequest) {
     try {
         const body = await req.json();
 
-        const response = await fetch("http://localhost:8000/api/chat", {
+        const response = await fetch(`${BACKEND_URL}/api/chat`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",

@@ -2,8 +2,7 @@
  * API Routes for /api/chats
  */
 import { NextRequest, NextResponse } from "next/server";
-
-const BACKEND_URL = "http://localhost:8000";
+import { BACKEND_URL } from "@/lib/api";
 
 export async function GET() {
     try {

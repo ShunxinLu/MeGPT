@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
+import { StoreProvider } from "@/lib/store";
 import Sidebar from "@/components/Sidebar";
 import ChatInterface from "@/components/ChatInterface";
 
@@ -10,7 +11,7 @@ interface Chat {
   updated_at?: string;
 }
 
-export default function Home() {
+function HomeContent() {
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChat, setActiveChat] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -63,7 +64,7 @@ export default function Home() {
   };
 
   return (
-    <main className="flex h-screen overflow-hidden">
+    <main id="main-content" className="flex h-screen overflow-hidden">
       <Sidebar
         chats={chats}
         activeChat={activeChat}
@@ -71,10 +72,25 @@ export default function Home() {
         onNewChat={handleNewChat}
         onDeleteChat={handleDeleteChat}
       />
-      <ChatInterface
+      {isLoading ? <div className="flex-1 flex items-center justify-center">
+        <div className="text-center">
+          <div className="inline-flex items-center gap-3 px-4 py-2 bg-violet-500/10 border border-violet-500/20 rounded-full">
+            <div className="w-2 h-2 rounded-full bg-violet-400 animate-pulse"></div>
+            <span className="text-sm text-violet-300">Loading memories...</span>
+          </div>
+        </div>
+      </div> : <ChatInterface
         chatId={activeChat}
         onChatCreated={handleChatCreated}
-      />
+      />}
     </main>
+  );
+}
+
+export default function Home() {
+  return (
+    <StoreProvider>
+      <HomeContent />
+    </StoreProvider>
   );
 }
