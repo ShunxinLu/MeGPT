@@ -30,3 +30,17 @@ sse-starlette>=2.0.0
 
 # LM Studio SDK (for auto-loading models)
 lmstudio>=1.5.0
+
+# Email Integration (Gmail/Outlook OAuth + sync)
+google-api-python-client>=2.0.0
+google-auth-oauthlib>=1.0.0
+msal>=1.20.0
+requests>=2.31.0
+keyring>=24.0.0
+
+# Email Processing (HTML sanitization, PII detection)
+beautifulsoup4>=4.12.0
+markdownify>=0.11.6
+# Optional: Presidio for advanced PII detection
+# presidio-analyzer>=2.2.0
+# presidio-anonymizer>=2.2.0

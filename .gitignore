@@ -34,8 +34,34 @@ frontend/build/
 data/
 *.db
 *.sqlite
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+*.log
+data/logs/
+
+# Credentials (OAuth tokens, API secrets)
+credentials/
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
 
 # IDE
 .vscode/
 .idea/
 .gemini/
+.claude/
+
+# Temp/dev files
+add_handlers.py
+fix_server.py
+nul
+temp_response.txt
+profile_*.py
+test_*.py
+profiling/
+.playwright-mcp/

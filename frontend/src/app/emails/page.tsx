@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Mail,
   Search,
@@ -37,125 +37,134 @@ type Email = {
   actionItems: string[];
 };
 
+type EmailListResponse = {
+  emails: Email[];
+  total: number;
+  page: number;
+  perPage: number;
+};
+
 type ViewMode = "list" | "detail" | "thread";
 
-const MOCK_EMAILS: Email[] = [
-  {
-    id: "1",
-    threadId: "thread-1",
-    subject: "Family Reunion Planning - Final Details",
-    sender: "Sarah Johnson",
-    senderEmail: "sarah.johnson@email.com",
-    body: "Hi everyone, just wanted to confirm the final details for our family reunion next month...",
-    date: "2025-01-19T09:30:00Z",
-    priority: "important",
-    category: "personal",
-    isRead: false,
-    isSpam: false,
-    hasAttachments: true,
-    summary: "Discussion about finalizing family reunion logistics, including venue confirmation and catering options.",
-    actionItems: [
-      "Confirm final headcount by Friday",
-      "Submit dietary restrictions",
-      "Coordinate travel arrangements",
-    ],
-  },
-  {
-    id: "2",
-    threadId: "thread-2",
-    subject: "Q4 Financial Review - Action Required",
-    sender: "Investment Advisor",
-    senderEmail: "advisor@financial.com",
-    body: "Dear valued client, please review your Q4 portfolio performance and consider the following recommendations...",
-    date: "2025-01-19T08:15:00Z",
-    priority: "critical",
-    category: "finance",
-    isRead: false,
-    isSpam: false,
-    hasAttachments: true,
-    summary: "Quarterly financial review with portfolio performance analysis and investment recommendations.",
-    actionItems: [
-      "Review portfolio performance",
-      "Review investment recommendations",
-      "Confirm asset allocation strategy",
-    ],
-  },
-  {
-    id: "3",
-    threadId: "thread-3",
-    subject: "Calendar Event Proposal: Team Meeting",
-    sender: "Work Calendar Bot",
-    senderEmail: "calendar@company.com",
-    body: "A new calendar event has been proposed for your approval...",
-    date: "2025-01-19T07:45:00Z",
-    priority: "important",
-    category: "work",
-    isRead: false,
-    isSpam: false,
-    hasAttachments: false,
-    summary: "Calendar proposal for team meeting on January 25th at 2:00 PM.",
-    actionItems: [
-      "Approve or reject calendar proposal",
-      "Review meeting agenda",
-    ],
-  },
-];
-
 export default function EmailsPage() {
-  const [emails, setEmails] = useState<Email[]>(MOCK_EMAILS);
+  const [emails, setEmails] = useState<Email[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
   const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [searchQuery, setSearchQuery] = useState("");
   const [filterPriority, setFilterPriority] = useState<string>("all");
   const [filterCategory, setFilterCategory] = useState<string>("all");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
 
-  // Filter emails based on search and filters
-  const filteredEmails = emails.filter((email) => {
-    const matchesSearch =
-      searchQuery === "" ||
-      email.subject.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      email.sender.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      email.body.toLowerCase().includes(searchQuery.toLowerCase());
+  // Fetch emails from backend
+  const fetchEmails = async (showRefreshLoading = false) => {
+    if (showRefreshLoading) setLoading(true);
+    setError(null);
 
-    const matchesPriority =
-      filterPriority === "all" || email.priority === filterPriority;
+    try {
+      const params = new URLSearchParams({
+        page: currentPage.toString(),
+        per_page: "50",
+      });
 
-    const matchesCategory =
-      filterCategory === "all" || email.category === filterCategory;
+      if (filterPriority !== "all") {
+        params.append("priority", filterPriority);
+      }
+      if (filterCategory !== "all") {
+        params.append("category", filterCategory);
+      }
+      if (searchQuery) {
+        params.append("search", searchQuery);
+      }
 
-    return matchesSearch && matchesPriority && matchesCategory;
-  });
+      const response = await fetch(`/api/email/emails?${params}`);
+      if (!response.ok) {
+        throw new Error("Failed to fetch emails");
+      }
+
+      const data: EmailListResponse = await response.json();
+      setEmails(data.emails);
+      setTotalCount(data.total);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load emails");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Initial load
+  useEffect(() => {
+    fetchEmails();
+  }, [currentPage, filterPriority, filterCategory]);
+
+  // Debounced search
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (currentPage === 1) {
+        fetchEmails();
+      } else {
+        setCurrentPage(1);
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   const handleEmailClick = (email: Email) => {
     setSelectedEmail(email);
     setViewMode("detail");
   };
 
-  const handleMarkRead = (emailId: string) => {
-    setEmails((prev) =>
-      prev.map((e) =>
-        e.id === emailId ? { ...e, isRead: true } : e
-      )
-    );
+  const handleMarkRead = async (emailId: string) => {
+    try {
+      await fetch(`/api/email/emails/${emailId}`, { method: "POST" });
+      setEmails((prev) =>
+        prev.map((e) =>
+          e.id === emailId ? { ...e, isRead: true } : e
+        )
+      );
+    } catch (err) {
+      console.error("Failed to mark email as read:", err);
+    }
   };
 
   const handleArchive = (emailId: string) => {
-    // Archive logic
-    console.log("Archive email:", emailId);
+    // Archive logic - for now just mark as read
+    handleMarkRead(emailId);
   };
 
-  const handleDelete = (emailId: string) => {
-    setEmails((prev) => prev.filter((e) => e.id !== emailId));
-    if (selectedEmail?.id === emailId) {
-      setSelectedEmail(null);
-      setViewMode("list");
+  const handleDelete = async (emailId: string) => {
+    try {
+      await fetch(`/api/email/emails/${emailId}`, { method: "DELETE" });
+      setEmails((prev) => prev.filter((e) => e.id !== emailId));
+      setTotalCount((prev) => Math.max(0, prev - 1));
+      if (selectedEmail?.id === emailId) {
+        setSelectedEmail(null);
+        setViewMode("list");
+      }
+    } catch (err) {
+      console.error("Failed to delete email:", err);
     }
   };
 
   const handleRefresh = () => {
-    setLoading(true);
-    setTimeout(() => setLoading(false), 1000);
+    fetchEmails(true);
+  };
+
+  const handleSync = async () => {
+    setSyncing(true);
+    try {
+      const response = await fetch("/api/email/sync", { method: "POST" });
+      if (!response.ok) throw new Error("Failed to start sync");
+      // Sync runs in background, refresh after a delay
+      setTimeout(() => fetchEmails(true), 2000);
+    } catch (err) {
+      console.error("Failed to start sync:", err);
+    } finally {
+      setSyncing(false);
+    }
   };
 
   const getPriorityColor = (priority: string) => {
@@ -232,6 +241,15 @@ export default function EmailsPage() {
 
               {/* Actions */}
               <div className="flex items-center space-x-3 ml-6">
+                {/* Sync Button */}
+                <button
+                  onClick={handleSync}
+                  disabled={syncing}
+                  className="px-4 py-2 rounded-lg bg-accent-tertiary/10 hover:bg-accent-tertiary/20 text-accent-tertiary font-medium border border-accent-tertiary/20 transition-all duration-200 cursor-pointer disabled:opacity-50"
+                >
+                  {syncing ? "Syncing..." : "Sync Emails"}
+                </button>
+
                 {/* Priority Filter */}
                 <select
                   value={filterPriority}
@@ -250,7 +268,7 @@ export default function EmailsPage() {
                 <button
                   onClick={handleRefresh}
                   disabled={loading}
-                  className="p-2 rounded-lg bg-primary/10 hover:bg-primary/20 border border-primary/20 transition-all duration-200 cursor-pointer"
+                  className="p-2 rounded-lg bg-primary/10 hover:bg-primary/20 border border-primary/20 transition-all duration-200 cursor-pointer disabled:opacity-50"
                 >
                   <RefreshCw
                     className={`w-5 h-5 text-primary ${
@@ -267,7 +285,7 @@ export default function EmailsPage() {
         <div className="flex-1 overflow-auto">
           <div className="max-w-7xl mx-auto px-6 py-6">
             <div className="grid grid-cols-1 gap-4">
-              {filteredEmails.map((email) => (
+              {emails.map((email) => (
                 <div
                   key={email.id}
                   onClick={() => handleEmailClick(email)}
@@ -393,17 +411,49 @@ export default function EmailsPage() {
               ))}
             </div>
 
-            {filteredEmails.length === 0 && (
+            {loading ? (
+              <div className="flex flex-col items-center justify-center py-16">
+                <RefreshCw className="w-16 h-16 text-tertiary mb-4 animate-spin" />
+                <h3 className="font-semibold text-primary text-lg mb-2">
+                  Loading emails...
+                </h3>
+              </div>
+            ) : error ? (
+              <div className="flex flex-col items-center justify-center py-16">
+                <AlertCircle className="w-16 h-16 text-error mb-4" />
+                <h3 className="font-semibold text-primary text-lg mb-2">
+                  Error loading emails
+                </h3>
+                <p className="text-secondary mb-4">{error}</p>
+                <button
+                  onClick={() => fetchEmails(true)}
+                  className="px-4 py-2 rounded-lg bg-primary/10 hover:bg-primary/20 text-primary font-medium border border-primary/20 transition-all duration-200"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : emails.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-16">
                 <Mail className="w-16 h-16 text-tertiary mb-4" />
                 <h3 className="font-semibold text-primary text-lg mb-2">
                   No emails found
                 </h3>
-                <p className="text-secondary">
-                  Try adjusting your search or filters
+                <p className="text-secondary mb-4">
+                  {totalCount === 0
+                    ? "No emails synced yet. Click 'Sync Emails' to get started."
+                    : "Try adjusting your search or filters"}
                 </p>
+                {totalCount === 0 && (
+                  <button
+                    onClick={handleSync}
+                    disabled={syncing}
+                    className="px-4 py-2 rounded-lg bg-accent-tertiary/10 hover:bg-accent-tertiary/20 text-accent-tertiary font-medium border border-accent-tertiary/20 transition-all duration-200"
+                  >
+                    {syncing ? "Syncing..." : "Sync Emails"}
+                  </button>
+                )}
               </div>
-            )}
+            ) : null}
           </div>
         </div>
       </div>

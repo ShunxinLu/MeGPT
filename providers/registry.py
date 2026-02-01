@@ -108,18 +108,41 @@ class ProviderRegistry:
         """Get info about all registered LLM providers"""
         info = []
         for provider_id, provider_class in self._llm_providers.items():
-            # Create a dummy instance to get info
             try:
+                # Try to get info from a dummy instance
                 dummy = provider_class({})
                 info.append(dummy.get_provider_info())
             except Exception as e:
-                logger.warning(f"Could not get info for {provider_id}: {e}")
-                info.append({
-                    "id": provider_id,
-                    "name": provider_id,
-                    "description": "Error loading provider info",
-                    "error": str(e),
-                })
+                logger.warning(f"Could not instantiate {provider_id}: {e}")
+                # Fall back to class attributes when instantiation fails
+                try:
+                    # Access class attributes directly
+                    provider_info = {
+                        "id": getattr(provider_class, 'provider_id', provider_id),
+                        "name": getattr(provider_class, 'provider_name', provider_id),
+                        "description": getattr(provider_class, 'description', f"{provider_id} provider"),
+                        "config_schema": getattr(provider_class, 'config_schema', {}),
+                        "supports_streaming": True,  # Default assumption
+                        "supports_tools": True,  # Default assumption
+                        "max_context": 4096,  # Default
+                        "default_model": "default",
+                        "available_models": getattr(provider_class, 'AVAILABLE_MODELS', []),
+                    }
+                    info.append(provider_info)
+                except Exception as class_error:
+                    logger.error(f"Could not get class attributes for {provider_id}: {class_error}")
+                    # Last resort: minimal info
+                    info.append({
+                        "id": provider_id,
+                        "name": provider_id,
+                        "description": "Provider (minimal info available)",
+                        "config_schema": {},
+                        "supports_streaming": True,
+                        "supports_tools": True,
+                        "max_context": 4096,
+                        "default_model": "default",
+                        "available_models": [],
+                    })
         return info
 
 

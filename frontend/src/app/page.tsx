@@ -64,7 +64,7 @@ function HomeContent() {
   };
 
   return (
-    <main id="main-content" className="flex h-screen overflow-hidden">
+    <main id="main-content" className="flex h-screen overflow-hidden pt-20">
       <Sidebar
         chats={chats}
         activeChat={activeChat}

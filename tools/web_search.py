@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from ddgs import DDGS
 from langchain_core.tools import tool
 from config import config
+import httpx
+from exceptions import ExternalServiceError, LLMError, wrap_exception
 import time
 import random
 
@@ -40,21 +42,36 @@ def _safe_search(query: str, max_results: int = 5) -> list:
             if attempt > 0:
                 delay = RETRY_DELAY * (attempt + 1) + random.random()
                 print(
-                    f"   ⏳ Retry {attempt + 1}/{MAX_RETRIES} after {delay:.1f}s delay..."
+                    f"   [RETRY] {attempt + 1}/{MAX_RETRIES} after {delay:.1f}s delay..."
                 )
                 time.sleep(delay)
 
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=max_results))
-                print(f"   📥 Got {len(results)} results")
+                print(f"   [RESULT] Got {len(results)} results")
                 return results
 
+        except httpx.TimeoutException as e:
+            wrapped = wrap_exception(e, ExternalServiceError, operation="web_search")
+            print(f"   [WARN] Search attempt {attempt + 1} failed (timeout): {wrapped}")
+            last_error = e
+        except httpx.HTTPStatusError as e:
+            wrapped = wrap_exception(e, ExternalServiceError, operation="web_search")
+            print(f"   [WARN] Search attempt {attempt + 1} failed (HTTP error): {wrapped}")
+            last_error = e
+        except httpx.RequestError as e:
+            wrapped = wrap_exception(e, ExternalServiceError, operation="web_search")
+            print(
+                f"   [WARN] Search attempt {attempt + 1} failed (request error): {wrapped}"
+            )
+            last_error = e
         except Exception as e:
-            print(f"   ⚠ Search attempt {attempt + 1} failed: {e}")
+            wrapped = wrap_exception(e, ExternalServiceError, operation="web_search")
+            print(f"   [WARN] Search attempt {attempt + 1} failed: {wrapped}")
             last_error = e
 
     # All retries exhausted
-    print(f"   ❌ All {MAX_RETRIES} retries failed for: {query}")
+    print(f"   [ERROR] All {MAX_RETRIES} retries failed for: {query}")
     return []
 
 
@@ -87,10 +104,10 @@ def web_search(query: str) -> str:
     Returns:
         Formatted search results with titles, snippets, and URLs
     """
-    print(f"🔎 [WEB_SEARCH] Query: '{query}'")
+    print(f"[WEB_SEARCH] Query: '{query}'")
 
     if not config.enable_web_search:
-        print("   ❌ Web search is disabled")
+        print("   [DISABLED] Web search is disabled")
         return "Web search is disabled via config."
 
     try:
@@ -101,11 +118,24 @@ def web_search(query: str) -> str:
             return f"No results found for: {query}. Try rephrasing your query."
 
         output = _format_results(results)
-        print(f"   ✅ Returning {len(output)} chars from {len(results)} sources")
+        print(f"   [OK] Returning {len(output)} chars from {len(results)} sources")
         return output
 
+    except httpx.TimeoutException as e:
+        wrapped = wrap_exception(e, ExternalServiceError, operation="web_search")
+        print(f"   [ERROR] Search error (timeout): {wrapped}")
+        return f"Error performing web search: {str(e)}"
+    except httpx.HTTPStatusError as e:
+        wrapped = wrap_exception(e, ExternalServiceError, operation="web_search")
+        print(f"   [ERROR] Search error (HTTP error): {wrapped}")
+        return f"Error performing web search: {str(e)}"
+    except httpx.RequestError as e:
+        wrapped = wrap_exception(e, ExternalServiceError, operation="web_search")
+        print(f"   [ERROR] Search error (request error): {wrapped}")
+        return f"Error performing web search: {str(e)}"
     except Exception as e:
-        print(f"   ❌ Search error: {e}")
+        wrapped = wrap_exception(e, ExternalServiceError, operation="web_search")
+        print(f"   [ERROR] Search error: {wrapped}")
         return f"Error performing web search: {str(e)}"
 
 
@@ -115,7 +145,7 @@ async def web_search_async(query: str) -> str:
     Async web search - runs blocking I/O in a thread pool.
     Use this in FastAPI endpoints to avoid blocking the event loop.
     """
-    print(f"🔎 [WEB_SEARCH_ASYNC] Query: '{query}'")
+    print(f"[WEB_SEARCH_ASYNC] Query: '{query}'")
 
     if not config.enable_web_search:
         return "Web search is disabled via config."
@@ -129,7 +159,17 @@ async def web_search_async(query: str) -> str:
 
         return _format_results(results)
 
+    except httpx.TimeoutException as e:
+        wrapped = wrap_exception(e, ExternalServiceError, operation="web_search_async")
+        return f"Error performing web search: {str(e)}"
+    except httpx.HTTPStatusError as e:
+        wrapped = wrap_exception(e, ExternalServiceError, operation="web_search_async")
+        return f"Error performing web search: {str(e)}"
+    except httpx.RequestError as e:
+        wrapped = wrap_exception(e, ExternalServiceError, operation="web_search_async")
+        return f"Error performing web search: {str(e)}"
     except Exception as e:
+        wrapped = wrap_exception(e, ExternalServiceError, operation="web_search_async")
         return f"Error performing web search: {str(e)}"
 
 

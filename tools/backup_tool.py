@@ -13,6 +13,12 @@ from typing import Optional
 from dataclasses import dataclass, asdict
 
 from config import config
+from exceptions import (
+    DatabaseError,
+    ExternalServiceError,
+    MemoryServiceError,
+    wrap_exception,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +65,13 @@ def _get_db_stats() -> tuple[int, int]:
         msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         conn.close()
         return chat_count, msg_count
-    except Exception:
+    except sqlite3.Error as e:
+        wrapped = wrap_exception(e, DatabaseError, operation="get_db_stats")
+        logger.debug(f"Database error getting stats: {wrapped}")
+        return 0, 0
+    except Exception as e:
+        wrapped = wrap_exception(e, ExternalServiceError, operation="get_db_stats")
+        logger.debug(f"Unexpected error getting stats: {wrapped}")
         return 0, 0
 
 
@@ -71,7 +83,9 @@ def _get_memory_count() -> int:
         client = QdrantClient(host=config.qdrant_host, port=config.qdrant_port)
         info = client.get_collection(config.qdrant_collection)
         return info.points_count or 0
-    except Exception:
+    except Exception as e:
+        wrapped = wrap_exception(e, MemoryServiceError, operation="get_memory_count")
+        logger.debug(f"Memory service error getting count: {wrapped}")
         return 0
 
 
@@ -110,7 +124,8 @@ def _export_qdrant_vectors(output_path: Path) -> bool:
         output_path.write_text(json.dumps(all_points, indent=2))
         return True
     except Exception as e:
-        logger.error(f"Vector export failed: {e}")
+        wrapped = wrap_exception(e, MemoryServiceError, operation="vector_export")
+        logger.error(f"Vector export failed: {wrapped}")
         return False
 
 
@@ -161,7 +176,8 @@ def _import_qdrant_vectors(input_path: Path) -> bool:
 
         return True
     except Exception as e:
-        logger.error(f"Vector import failed: {e}")
+        wrapped = wrap_exception(e, MemoryServiceError, operation="vector_import")
+        logger.error(f"Vector import failed: {wrapped}")
         return False
 
 
@@ -244,12 +260,41 @@ def create_backup(description: str = "") -> Optional[BackupInfo]:
         _save_manifest(manifest)
 
         logger.info(f"Backup created: {backup_id}")
-        logger.info(f"  Chats: {chat_count}, Messages: {msg_count}, Memories: {memory_count}")
+        logger.info(
+            f"  Chats: {chat_count}, Messages: {msg_count}, Memories: {memory_count}"
+        )
 
         return backup
 
+    except sqlite3.Error as e:
+        wrapped = wrap_exception(e, DatabaseError, operation="create_backup")
+        logger.error(f"Backup failed (database): {wrapped}")
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+        return None
+    except MemoryServiceError as e:
+        logger.error(f"Backup failed (memory service): {e}")
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+        return None
+    except (OSError, IOError) as e:
+        wrapped = wrap_exception(e, ExternalServiceError, operation="create_backup")
+        logger.error(f"Backup failed (file I/O): {wrapped}")
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+        return None
     except Exception as e:
-        logger.error(f"Backup failed: {e}")
+        wrapped = wrap_exception(e, ExternalServiceError, operation="create_backup")
+        logger.error(f"Backup failed: {wrapped}")
         if conn:
             try:
                 conn.close()
@@ -308,8 +353,20 @@ def restore_backup(backup_id: str) -> bool:
         logger.info(f"Restore complete: {backup_id}")
         return True
 
+    except sqlite3.Error as e:
+        wrapped = wrap_exception(e, DatabaseError, operation="restore_backup")
+        logger.error(f"Restore failed (database): {wrapped}")
+        return False
+    except MemoryServiceError as e:
+        logger.error(f"Restore failed (memory service): {e}")
+        return False
+    except (OSError, IOError) as e:
+        wrapped = wrap_exception(e, ExternalServiceError, operation="restore_backup")
+        logger.error(f"Restore failed (file I/O): {wrapped}")
+        return False
     except Exception as e:
-        logger.error(f"Restore failed: {e}")
+        wrapped = wrap_exception(e, ExternalServiceError, operation="restore_backup")
+        logger.error(f"Restore failed: {wrapped}")
         return False
 
 

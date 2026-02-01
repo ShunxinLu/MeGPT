@@ -7,11 +7,17 @@ import logging
 import json
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
 
 from config import config, save_provider_config, load_provider_config, get_all_provider_configs
 from config import save_data_source_config, get_all_data_source_configs
+from config import (
+    save_embedding_provider_config,
+    load_embedding_provider_config,
+    get_active_embedding_provider,
+    get_all_embedding_provider_configs,
+)
 from providers.base import provider_registry
 from providers.base import (
     OpenAIProvider,
@@ -159,19 +165,58 @@ async def list_providers() -> Dict[str, Any]:
     active = config.get_active_llm_provider()
     active_id = active.provider_id if active else None
 
-    # Merge status
+    # Merge status and fetch dynamic models for connected providers
     for provider_info in available:
         provider_id = provider_info["id"]
         if provider_id in configured:
             provider_info["enabled"] = configured[provider_id]["enabled"]
             provider_info["is_default"] = configured[provider_id].get("is_default", False)
             provider_info["has_config"] = True
+            
+            # Fetch dynamic models for connected providers
+            try:
+                provider_class = provider_registry.get_llm_provider(provider_id)
+                if provider_class:
+                    instance = provider_class(configured[provider_id]["config"])
+                    if hasattr(instance, 'get_available_models'):
+                        # Check if it's an async method
+                        import inspect
+                        if inspect.iscoroutinefunction(instance.get_available_models):
+                            dynamic_models = await instance.get_available_models()
+                        else:
+                            dynamic_models = instance.get_available_models()
+                        
+                        if dynamic_models:
+                            provider_info["available_models"] = dynamic_models
+            except Exception as e:
+                logger.warning(f"Could not fetch models for {provider_id}: {e}")
+                # Keep the static model list from class attribute
+                
         else:
             # Check if env var config exists
             provider_config = config.get_provider_config(provider_id)
             if provider_config:
                 provider_info["enabled"] = provider_config.enabled
                 provider_info["has_config"] = True
+                
+                # Fetch dynamic models for env-configured providers
+                try:
+                    provider_class = provider_registry.get_llm_provider(provider_id)
+                    if provider_class:
+                        logger.info(f"Fetching models for {provider_id} with config: {provider_config.config}")
+                        instance = provider_class(provider_config.config)
+                        if hasattr(instance, 'get_available_models'):
+                            import inspect
+                            if inspect.iscoroutinefunction(instance.get_available_models):
+                                dynamic_models = await instance.get_available_models()
+                            else:
+                                dynamic_models = instance.get_available_models()
+                            
+                            logger.info(f"Got models for {provider_id}: {dynamic_models}")
+                            if dynamic_models:
+                                provider_info["available_models"] = dynamic_models
+                except Exception as e:
+                    logger.warning(f"Could not fetch models for {provider_id}: {e}", exc_info=True)
             else:
                 provider_info["enabled"] = False
                 provider_info["has_config"] = False
@@ -199,6 +244,60 @@ async def get_provider_info(provider_id: str) -> ProviderInfo:
             return ProviderInfo(**provider)
 
     raise HTTPException(status_code=404, detail=f"Provider {provider_id} not found")
+
+
+@router.get("/models/{provider_id}")
+async def get_provider_models(provider_id: str) -> Dict[str, Any]:
+    """
+    Get available models for a specific provider.
+    
+    For providers with API access, fetches models dynamically.
+    Falls back to AVAILABLE_MODELS class attribute.
+    
+    Args:
+        provider_id: Provider identifier
+        
+    Returns:
+        Dictionary with models list and source
+    """
+    provider_class = provider_registry.get_llm_provider(provider_id)
+    if not provider_class:
+        raise HTTPException(status_code=404, detail=f"Provider {provider_id} not found")
+    
+    # Try to get models from class attribute first
+    models = getattr(provider_class, 'AVAILABLE_MODELS', None)
+    
+    if models:
+        return {
+            "provider_id": provider_id,
+            "models": models,
+            "source": "static",
+        }
+    
+    # Try to get from a configured instance (for dynamic providers like Ollama)
+    try:
+        saved_config = load_provider_config(provider_id)
+        if saved_config and saved_config.get("config"):
+            instance = provider_class(saved_config["config"])
+            if hasattr(instance, 'get_available_models'):
+                dynamic_models = instance.get_available_models()
+                return {
+                    "provider_id": provider_id,
+                    "models": dynamic_models,
+                    "source": "dynamic",
+                }
+    except Exception as e:
+        logger.warning(f"Could not fetch dynamic models for {provider_id}: {e}")
+    
+    # Fallback to default model from config schema
+    schema = getattr(provider_class, 'config_schema', {})
+    default_model = schema.get("properties", {}).get("model", {}).get("default", "default")
+    
+    return {
+        "provider_id": provider_id,
+        "models": [default_model],
+        "source": "default",
+    }
 
 
 @router.post("/configure")
@@ -247,38 +346,75 @@ async def configure_provider(request: ProviderConfigRequest) -> Dict[str, Any]:
 
 
 @router.post("/set-default")
-async def set_default_provider(provider_id: str) -> Dict[str, Any]:
+async def set_default_provider(request: Request) -> Dict[str, Any]:
     """
-    Set a provider as the default active provider.
+    Set a provider as the default active provider and optionally select a model.
 
     Args:
-        provider_id: Provider to set as default
+        request: JSON body with provider_id and optional model
 
     Returns:
         Success status
     """
+    body = await request.json()
+    provider_id = body.get("provider_id")
+    model = body.get("model")
+    
+    if not provider_id:
+        raise HTTPException(status_code=400, detail="provider_id is required")
+    
     if provider_id not in provider_registry.list_llm_providers():
         raise HTTPException(status_code=404, detail=f"Unknown provider: {provider_id}")
-
-    # Load current configs
-    all_configs = get_all_provider_configs()
 
     # Update database to set this as default and clear others
     import sqlite3
     conn = sqlite3.connect(config.providers_db_path)
+    
+    # Clear default from all providers
     conn.execute("""
         UPDATE provider_configs SET is_default = 0
     """)
-    conn.execute("""
-        UPDATE provider_configs SET is_default = 1, enabled = 1
-        WHERE provider_id = ?
+    
+    # Get current config for this provider
+    cursor = conn.execute("""
+        SELECT config FROM provider_configs WHERE provider_id = ?
     """, (provider_id,))
+    row = cursor.fetchone()
+    
+    if row:
+        # Update existing config with new model
+        current_config = json.loads(row[0])
+        if model:
+            current_config["model"] = model
+        
+        conn.execute("""
+            UPDATE provider_configs 
+            SET is_default = 1, enabled = 1, config = ?
+            WHERE provider_id = ?
+        """, (json.dumps(current_config), provider_id))
+    else:
+        # Provider not in database - try to get from env config and save to DB
+        env_config = config.get_provider_config(provider_id)
+        if env_config:
+            provider_config = dict(env_config.config)
+            if model:
+                provider_config["model"] = model
+            
+            conn.execute("""
+                INSERT OR REPLACE INTO provider_configs 
+                (provider_id, config, enabled, is_default)
+                VALUES (?, ?, 1, 1)
+            """, (provider_id, json.dumps(provider_config)))
+        else:
+            conn.close()
+            raise HTTPException(status_code=400, detail=f"Provider {provider_id} not configured")
+    
     conn.commit()
     conn.close()
 
-    logger.info(f"Default provider set to: {provider_id}")
+    logger.info(f"Default provider set to: {provider_id}, model: {model}")
 
-    return {"success": True, "default_provider": provider_id}
+    return {"success": True, "default_provider": provider_id, "model": model}
 
 
 @router.get("/default")
@@ -538,3 +674,173 @@ async def delete_data_source(source_id: str) -> Dict[str, Any]:
     logger.info(f"Data source {source_id} deleted")
 
     return {"success": True, "source_id": source_id}
+
+
+# ========== Embedding Provider Endpoints ==========
+
+class EmbeddingProviderConfigRequest(BaseModel):
+    """Request to save/update embedding provider configuration"""
+    provider_id: str
+    config: Dict[str, Any]
+    enabled: bool = True
+    is_default: bool = False
+
+
+@router.get("/embedding")
+async def list_embedding_providers() -> Dict[str, Any]:
+    """
+    List all available embedding providers with their configuration status.
+
+    Returns:
+        Dictionary with available providers and active provider
+    """
+    # Available embedding provider types
+    available = [
+        {
+            "id": "openai",
+            "name": "OpenAI Embeddings",
+            "description": "OpenAI text-embedding models (text-embedding-3-small, text-embedding-3-large)",
+            "default_model": "text-embedding-3-small",
+            "available_models": ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"],
+        },
+        {
+            "id": "lmstudio",
+            "name": "LM Studio",
+            "description": "Local embedding models via LM Studio",
+            "default_model": "text-embedding-bge-m3",
+            "available_models": ["text-embedding-bge-m3", "nomic-embed-text-v1.5", "all-MiniLM-L6-v2"],
+        },
+        {
+            "id": "ollama",
+            "name": "Ollama",
+            "description": "Local embedding models via Ollama",
+            "default_model": "nomic-embed-text",
+            "available_models": ["nomic-embed-text", "mxbai-embed-large", "all-minilm"],
+        },
+    ]
+
+    # Get configured providers from database
+    configured = get_all_embedding_provider_configs()
+
+    # Get active provider
+    active = get_active_embedding_provider()
+    active_id = active["provider_id"] if active else None
+
+    # Merge status
+    for provider_info in available:
+        provider_id = provider_info["id"]
+        if provider_id in configured:
+            provider_info["enabled"] = configured[provider_id]["enabled"]
+            provider_info["is_default"] = configured[provider_id].get("is_default", False)
+            provider_info["has_config"] = True
+            # Use configured model if available
+            if "model" in configured[provider_id]["config"]:
+                provider_info["current_model"] = configured[provider_id]["config"]["model"]
+        else:
+            provider_info["enabled"] = False
+            provider_info["is_default"] = False
+            provider_info["has_config"] = False
+
+    return {
+        "available": available,
+        "active": active_id,
+    }
+
+
+@router.post("/embedding/configure")
+async def configure_embedding_provider(request: EmbeddingProviderConfigRequest) -> Dict[str, Any]:
+    """
+    Save or update embedding provider configuration.
+
+    Args:
+        request: Embedding provider configuration request
+
+    Returns:
+        Success status and updated configuration
+    """
+    provider_id = request.provider_id
+
+    # Validate provider exists
+    valid_providers = ["openai", "lmstudio", "ollama"]
+    if provider_id not in valid_providers:
+        raise HTTPException(status_code=404, detail=f"Unknown embedding provider: {provider_id}")
+
+    # Prepare config with is_default flag
+    config_data = {**request.config, "is_default": request.is_default}
+
+    # Save configuration
+    save_embedding_provider_config(provider_id, config_data)
+
+    logger.info(f"Embedding provider {provider_id} configured")
+
+    return {
+        "success": True,
+        "provider_id": provider_id,
+        "enabled": request.enabled,
+        "is_default": request.is_default,
+    }
+
+
+@router.post("/embedding/set-default")
+async def set_default_embedding_provider(request: Request) -> Dict[str, Any]:
+    """
+    Set an embedding provider as the default active provider.
+
+    Args:
+        request: JSON body with provider_id
+
+    Returns:
+        Success status
+    """
+    body = await request.json()
+    provider_id = body.get("provider_id")
+
+    if not provider_id:
+        raise HTTPException(status_code=400, detail="provider_id is required")
+
+    # Update database to set this as default and clear others
+    import sqlite3
+    conn = sqlite3.connect(config.providers_db_path)
+
+    # Clear default from all embedding providers
+    conn.execute("""
+        UPDATE embedding_provider_configs SET is_default = 0
+    """)
+
+    # Enable and set as default
+    conn.execute("""
+        UPDATE embedding_provider_configs
+        SET is_default = 1, enabled = 1
+        WHERE provider_id = ?
+    """, (provider_id,))
+
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Default embedding provider set to: {provider_id}")
+
+    return {"success": True, "default_provider": provider_id}
+
+
+@router.get("/embedding/default")
+async def get_default_embedding_provider() -> Dict[str, Any]:
+    """Get the current default embedding provider configuration"""
+    active = get_active_embedding_provider()
+
+    if active:
+        return {
+            "provider_id": active["provider_id"],
+            "config": active["config"],
+            "enabled": active["enabled"],
+        }
+
+    # Fallback to env vars
+    return {
+        "provider_id": "env",
+        "config": {
+            "base_url": config.embedder_base_url,
+            "model": config.embedder_model_name,
+        },
+        "enabled": True,
+        "source": "environment",
+    }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { AlertCircle, StopCircle, RefreshCw, Brain, Search, Sparkles, Terminal } from "lucide-react";
+import { AlertCircle, StopCircle, RefreshCw, Brain, Search, Sparkles, Terminal, ChevronDown, Plus } from "lucide-react";
 import MessageBubble from "./MessageBubble";
 import InputArea from "./InputArea";
 import ToastContainer from "./Toast";
@@ -11,6 +11,29 @@ interface Message {
     id: string;
     role: "user" | "assistant";
     content: string;
+}
+
+interface ProviderInfo {
+    id: string;
+    name: string;
+    description: string;
+    config_schema: {
+        required?: string[];
+        properties?: Record<string, { type: string; description: string; default?: any }>;
+    };
+    supports_streaming: boolean;
+    supports_tools: boolean;
+    max_context: number;
+    default_model: string;
+    available_models: string[];
+    enabled: boolean;
+    has_config: boolean;
+    is_default: boolean;
+}
+
+interface ProvidersResponse {
+    available: ProviderInfo[];
+    active: string | null;
 }
 
 interface ChatInterfaceProps {
@@ -36,6 +59,11 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
     const [lastUserMessage, setLastUserMessage] = useState<string>("");
     const [toasts, setToasts] = useState<Toast[]>([]);
 
+    // Model selector state
+    const [providers, setProviders] = useState<ProviderInfo[]>([]);
+    const [activeProvider, setActiveProvider] = useState<string | null>(null);
+    const [activeModel, setActiveModel] = useState<string>("");
+
     // Load messages when chat changes
     useEffect(() => {
         setCurrentChatId(chatId);
@@ -45,6 +73,77 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
             setMessages([]);
         }
     }, [chatId]);
+
+    // Load providers on mount
+    useEffect(() => {
+        loadProviders();
+    }, []);
+
+    const loadProviders = async () => {
+        try {
+            const res = await fetch("/api/providers/list");
+            if (res.ok) {
+                const data: ProvidersResponse = await res.json();
+                setProviders(data.available);
+                setActiveProvider(data.active);
+
+                // Set active model from active provider
+                const active = data.available.find(p => p.id === data.active);
+                if (active && active.available_models.length > 0) {
+                    setActiveModel(active.available_models[0]);
+                }
+            }
+        } catch (error) {
+            console.error("Failed to load providers:", error);
+        }
+    };
+
+    const getAllModels = () => {
+        const models: { provider: string; model: string; providerName: string }[] = [];
+        for (const provider of providers) {
+            const connected = provider.has_config === true;
+            if (connected && provider.available_models && provider.available_models.length > 0) {
+                for (const model of provider.available_models) {
+                    models.push({
+                        provider: provider.id,
+                        model,
+                        providerName: provider.name,
+                    });
+                }
+            }
+        }
+        return models;
+    };
+
+    const handleModelChange = async (value: string) => {
+        const [providerId, model] = value.split("::");
+        const provider = providers.find(p => p.id === providerId);
+
+        if (!provider) return;
+
+        const connected = provider.has_config === true;
+
+        if (!connected) {
+            // Redirect to settings to connect provider
+            window.location.href = "/settings/providers";
+            return;
+        }
+
+        setActiveModel(model);
+
+        try {
+            await fetch("/api/providers/set-default", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ provider_id: providerId, model }),
+            });
+            setActiveProvider(providerId);
+        } catch (error) {
+            console.error("Failed to switch model:", error);
+        }
+    };
+
+    const allModels = getAllModels();
 
     // Auto-scroll to bottom
     useEffect(() => {
@@ -249,8 +348,43 @@ export default function ChatInterface({ chatId, onChatCreated }: ChatInterfacePr
                 style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E")` }}>
             </div>
 
+            {/* Model Selector - ChatGPT Style */}
+            <div className="relative z-20 px-4 md:px-8 pt-3 pb-2">
+                <div className="max-w-xs mx-auto">
+                    {allModels.length > 0 ? (
+                        <div className="relative group">
+                            <select
+                                value={`${activeProvider}::${activeModel}`}
+                                onChange={(e) => handleModelChange(e.target.value)}
+                                className="w-full px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-violet-500/30 rounded-xl text-sm text-zinc-300 focus:outline-none focus:border-violet-500/50 transition-all cursor-pointer appearance-none pr-8"
+                                style={{
+                                    backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='currentColor'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/svg%3E")`,
+                                    backgroundRepeat: 'no-repeat',
+                                    backgroundPosition: 'right 0.5rem center',
+                                    backgroundSize: '1rem',
+                                }}
+                            >
+                                {allModels.map(({ provider, model, providerName }) => (
+                                    <option key={`${provider}::${model}`} value={`${provider}::${model}`}>
+                                        {model}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                    ) : (
+                        <button
+                            onClick={() => window.location.href = "/settings/providers"}
+                            className="w-full px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-violet-500/30 rounded-xl text-sm text-zinc-400 hover:text-zinc-200 transition-all flex items-center justify-center gap-2"
+                        >
+                            <Plus className="w-4 h-4" />
+                            Add Model
+                        </button>
+                    )}
+                </div>
+            </div>
+
             {/* Chat Messages Area */}
-            <div className="flex-1 overflow-y-auto px-4 md:px-8 pb-32 pt-6 scrollbar-thin z-10">
+            <div className="flex-1 overflow-y-auto px-4 md:px-8 pb-32 pt-2 scrollbar-thin z-10">
                 <div className="max-w-3xl mx-auto space-y-8">
                     {/* Welcome Screen */}
                     {messages.length === 0 && (

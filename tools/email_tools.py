@@ -26,23 +26,36 @@ def search_emails(query: str, limit: int = 5, priority: str = "all") -> str:
     Returns:
         Formatted string with search results
     """
-    print(f"🔍 Searching emails for: {query}")
+    print(f"[SEARCH] Emails for: {query}")
+
+    # Sanitize query to prevent FTS5 injection
+    sanitized = query.replace('"', ' ').replace('*', ' ').replace('(', ' ').replace(')', ' ')
+    sanitized = ' '.join(sanitized.split())  # Remove extra whitespace
+
+    # If sanitized query is empty, return all emails (no filter)
+    if not sanitized or sanitized.strip() == "":
+        # Return a helpful message instead of error
+        return "Please provide a specific search term to find emails."
 
     with get_connection() as conn:
-        # Build SQL query with filters
+        # Build SQL query: search FTS, get data from base table
+        # Note: We search the FTS table directly and join back to emails for full data
         sql_query = """
-            SELECT id, subject, sender, sender_email, date_received, priority, category, summary
-            FROM emails_fts
-            WHERE emails_fts MATCH ?
+            SELECT e.id, e.subject, e.sender, e.sender_email, e.date_received,
+                   e.priority, e.category, e.summary
+            FROM emails e
+            WHERE e.rowid IN (
+                SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?
+            )
         """
-        params = [query]
+        params = [sanitized]
 
         # Add priority filter if specified
         if priority and priority != "all":
-            sql_query += " AND priority = ?"
+            sql_query += " AND e.priority = ?"
             params.append(priority)
 
-        sql_query += " ORDER BY date_received DESC LIMIT ?"
+        sql_query += " ORDER BY e.date_received DESC LIMIT ?"
         params.append(limit)
 
         cursor = conn.execute(sql_query, tuple(params))
@@ -87,7 +100,7 @@ def get_email_thread(email_id: str) -> str:
     Returns:
         Formatted thread with all emails in the conversation
     """
-    print(f"📧 Getting email thread for ID: {email_id}")
+    print(f"[THREAD] Getting email thread for ID: {email_id}")
 
     with get_connection() as conn:
         # First get the thread_id of the specified email
@@ -151,7 +164,7 @@ def list_unread_emails(limit: int = 10) -> str:
     Returns:
         Formatted list of unread emails
     """
-    print(f"📬 Listing unread emails (limit: {limit})")
+    print(f"[LIST] Unread emails (limit: {limit})")
 
     with get_connection() as conn:
         cursor = conn.execute(
@@ -204,7 +217,7 @@ def get_email_count(priority: str = "all") -> str:
     Returns:
         Formatted count breakdown
     """
-    print(f"📊 Getting email counts (priority: {priority})")
+    print(f"[COUNT] Email counts (priority: {priority})")
 
     with get_connection() as conn:
         if priority == "all":
@@ -241,17 +254,25 @@ def get_email_count(priority: str = "all") -> str:
 
         results = cursor.fetchall()
 
-        # Format results
+        # Format results - build a dict of priority -> count for easier lookup
+        count_by_priority = {r["priority"]: r["count"] for r in results}
+
+        # Format results with icons for each priority
+        priority_icons = {
+            "critical": "🔴",
+            "important": "🟠",
+            "normal": "🔵",
+            "low": "🟢",
+        }
+
         if priority == "all":
-            formatted = "\n".join(
-                [
-                    f"🔴 Critical: {r['count']} emails",
-                    f"🟠 Important: {r['count']} emails",
-                    f"🔵 Normal: {r['count']} emails",
-                    f"🟢 Low: {r['count']} emails",
-                ]
-            )
-            total = sum(r["count"] for r in results)
+            formatted_lines = []
+            for pri, icon in priority_icons.items():
+                count = count_by_priority.get(pri, 0)
+                formatted_lines.append(f"{icon} {pri.capitalize()}: {count} emails")
+
+            formatted = "\n".join(formatted_lines)
+            total = sum(count_by_priority.values())
             formatted += f"\n\n📊 Total: {total} emails"
         else:
             formatted = f"{sum(r['count'] for r in results)} emails found"

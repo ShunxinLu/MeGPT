@@ -2,8 +2,9 @@
 LM Studio Model Loader - Automatically loads models on startup.
 Uses LM Studio's REST API v0 for model management.
 """
+
 import httpx
-from config import config
+from utils.llm_factory import get_llm_config, get_embedding_config
 
 LMS_BASE_URL = "http://localhost:1234"
 
@@ -14,27 +15,29 @@ async def ensure_models_loaded():
     Uses the LM Studio REST API v0 endpoints.
     """
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             # Check what models are available
             models_resp = await client.get(f"{LMS_BASE_URL}/api/v0/models")
             if models_resp.status_code != 200:
                 print(f"⚠ Could not fetch models list: {models_resp.status_code}")
                 return False
-            
+
             available = models_resp.json()
-            print(f"Available models: {[m.get('id') or m.get('path') for m in available.get('data', [])]}")
-            
+            print(
+                f"Available models: {[m.get('id') or m.get('path') for m in available.get('data', [])]}"
+            )
+
             # Check loaded models
             loaded_resp = await client.get(f"{LMS_BASE_URL}/api/v0/models/loaded")
             if loaded_resp.status_code == 200:
                 loaded = loaded_resp.json()
-                loaded_ids = [m.get('id') for m in loaded.get('data', [])]
+                loaded_ids = [m.get("id") for m in loaded.get("data", [])]
                 print(f"Currently loaded: {loaded_ids}")
             else:
                 loaded_ids = []
-            
-            # Load chat model
-            chat_model = config.llm_model_name
+
+            # Load chat model - use database config, fallback to env vars
+            _, _, chat_model = get_llm_config()
             if chat_model not in loaded_ids:
                 print(f"Loading chat model: {chat_model} (context: 30000)...")
                 load_resp = await client.post(
@@ -42,35 +45,36 @@ async def ensure_models_loaded():
                     json={
                         "model": chat_model,
                         "context_length": 30000,
-                    }
+                    },
                 )
                 if load_resp.status_code == 200:
-                    print(f"✓ Chat model loaded: {chat_model}")
+                    print(f"[OK] Chat model loaded: {chat_model}")
                 else:
-                    print(f"⚠ Failed to load chat model: {load_resp.text}")
+                    print(f"[!] Failed to load chat model: {load_resp.text}")
             else:
-                print(f"✓ Chat model already loaded: {chat_model}")
-            
-            # Load embedding model
-            embed_model = config.embedder_model_name
+                print(f"[OK] Chat model already loaded: {chat_model}")
+
+            # Load embedding model - use database config, fallback to env vars
+            _, _, embed_model = get_embedding_config()
             if embed_model not in loaded_ids:
                 print(f"Loading embedding model: {embed_model}...")
                 load_resp = await client.post(
-                    f"{LMS_BASE_URL}/api/v0/models/load",
-                    json={"model": embed_model}
+                    f"{LMS_BASE_URL}/api/v0/models/load", json={"model": embed_model}
                 )
                 if load_resp.status_code == 200:
-                    print(f"✓ Embedding model loaded: {embed_model}")
+                    print(f"[OK] Embedding model loaded: {embed_model}")
                 else:
                     # Embeddings might auto-load on first use
-                    print(f"⚠ Embedding model may auto-load on first use")
+                    print(f"[!] Embedding model may auto-load on first use")
             else:
-                print(f"✓ Embedding model already loaded: {embed_model}")
-            
+                print(f"[OK] Embedding model already loaded: {embed_model}")
+
             return True
-            
+
     except httpx.ConnectError:
-        print("⚠ Cannot connect to LM Studio. Make sure it's running with the server enabled.")
+        print(
+            "[!] Cannot connect to LM Studio. Make sure it's running with the server enabled."
+        )
         return False
     except Exception as e:
         print(f"⚠ Failed to load models: {e}")
@@ -80,6 +84,7 @@ async def ensure_models_loaded():
 def load_models_sync():
     """Synchronous wrapper for model loading."""
     import asyncio
+
     return asyncio.run(ensure_models_loaded())
 
 

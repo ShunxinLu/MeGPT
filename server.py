@@ -14,12 +14,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from config import config
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from exceptions import MeGPTError
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# Configure logging with rotation (10-day retention)
+from utils.logging_config import setup_logging
+setup_logging()
 logger = logging.getLogger(__name__)
 from database import (
     create_chat,
@@ -64,6 +65,9 @@ from api.providers import router as providers_router
 # Import documents API
 from api.documents import router as documents_router
 
+# Import email API
+from api.email import router as email_router
+
 app = FastAPI(
     title="MeGPT Pro API",
     description="Privacy-first AI assistant with persistent memory",
@@ -75,6 +79,9 @@ app.include_router(providers_router)
 
 # Include documents routes
 app.include_router(documents_router)
+
+# Include email routes
+app.include_router(email_router)
 
 
 @app.on_event("startup")
@@ -159,6 +166,49 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ========== Exception Handlers ==========
+
+@app.exception_handler(MeGPTError)
+async def megpt_exception_handler(request: Request, exc: MeGPTError):
+    """Handle MeGPT custom exceptions."""
+    # Log error with context
+    logger.error(f"MeGPTError: {exc} | details: {exc.details}")
+    
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=exc.to_dict(),
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle FastAPI HTTP exceptions with consistent formatting."""
+    # Log the error (HTTPException might not have full context)
+    logger.warning(f"HTTPException: {exc.detail}")
+    
+    # Preserve existing FastAPI format for backward compatibility
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """Handle all other exceptions with sanitized error messages."""
+    # Log the full error for debugging
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    
+    # Sanitize error message for production
+    error_msg = str(exc) if not config.is_production else "Internal server error"
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": error_msg,
+            "error_code": "internal_server_error",
+        },
+    )
 
 
 # ========== Pydantic Models ==========
@@ -399,7 +449,7 @@ async def stream_response(
         ):
             # state_update is a dict with node name as key
             for node_name, node_output in state_update.items():
-                print(f"🔄 Node '{node_name}' completed")
+                print(f"[Node] '{node_name}' completed")
 
                 # Track status based on node
                 if node_name == "recall":
@@ -408,6 +458,8 @@ async def stream_response(
                     yield format_event("status", "💭 Thinking...")
                 elif node_name == "tools":
                     yield format_event("status", "🔎 Using web_search...")
+                elif node_name == "answer":
+                    yield format_event("status", "💭 Synthesizing answer...")
                 elif node_name == "respond":
                     # Get the final response from state
                     final = node_output.get("final_response", "")
@@ -503,21 +555,25 @@ async def delete_chat_endpoint(chat_id: str, user_id: Optional[str] = None):
     Delete a chat with cascading memory deletion.
     Phase 3: Wipes Tier 1 (Archive), Tier 2 (Facts), and Tier 3 (Summary).
 
-    CRITICAL: Delete SQLite FIRST to prevent orphaned memories on failure.
+    SAFETY: Delete Qdrant memories FIRST, then SQLite.
+    This prevents orphaned memories if SQLite delete fails.
+    If Qdrant delete fails, we don't delete the chat and user can retry.
     """
     uid = user_id or config.user_id
 
     logger.info(f"Starting cascading delete for chat {chat_id[:8]}...")
 
-    # STEP 1: Delete SQLite FIRST (can be rolled back if needed)
+    # STEP 1: Delete Qdrant memories FIRST (prevents orphaning)
+    deleted_memories = delete_memories_for_chat(chat_id, uid)
+
+    # STEP 2: Delete SQLite after memories are deleted
     try:
         delete_chat(chat_id)
     except Exception as e:
         logger.error(f"Failed to delete chat from SQLite: {e}")
+        # Memories are already deleted, but chat still exists - log this inconsistency
+        logger.warning(f"Memories deleted for {chat_id[:8]} but chat record remains")
         raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
-
-    # STEP 2: Only delete memories after SQLite delete succeeds
-    deleted_memories = delete_memories_for_chat(chat_id, uid)
 
     logger.info(f"Chat and {deleted_memories} memories permanently deleted")
     return {"success": True, "deleted_memories": deleted_memories}
@@ -600,6 +656,61 @@ async def get_email_count_endpoint(
     """Get email count by priority."""
     result = get_email_count.invoke({"priority": priority})
     return {"counts": result}
+
+
+@app.get("/api/emails/notifications")
+async def get_email_notifications_endpoint(_auth: None = Depends(verify_api_key)):
+    """
+    Get smart notification counts - only important items worth notifying about.
+
+    Returns:
+        Structured counts for critical/important emails (excludes spam/low priority)
+    """
+    from database import get_connection
+
+    try:
+        with get_connection() as conn:
+            # Count only critical and important emails that are unread
+            cursor = conn.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE priority = 'critical') as critical,
+                    COUNT(*) FILTER (WHERE priority = 'important') as important
+                FROM emails
+                WHERE is_read = 0
+                  AND is_spam_or_scam = 0
+            """)
+
+            row = cursor.fetchone()
+            critical_count = row["critical"] if row else 0
+            important_count = row["important"] if row else 0
+            total_important = critical_count + important_count
+
+            # Also get a brief summary of the most critical item
+            cursor = conn.execute("""
+                SELECT subject, sender, priority
+                FROM emails
+                WHERE is_read = 0
+                  AND is_spam_or_scam = 0
+                  AND priority = 'critical'
+                ORDER BY date_received DESC
+                LIMIT 1
+            """)
+
+            top_critical = cursor.fetchone()
+
+            return {
+                "critical": critical_count,
+                "important": important_count,
+                "total_important": total_important,
+                "summary": f"{critical_count} critical, {important_count} important emails",
+                "top_critical": {
+                    "subject": top_critical["subject"] if top_critical else None,
+                    "sender": top_critical["sender"] if top_critical else None,
+                } if top_critical else None
+            }
+    except Exception as e:
+        logger.error(f"Error fetching email notifications: {e}")
+        return {"critical": 0, "important": 0, "total_important": 0}
 
 
 # ========== Domain Endpoints: Calendar ==========

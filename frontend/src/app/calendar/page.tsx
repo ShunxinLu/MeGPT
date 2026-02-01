@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Calendar,
   Clock,
@@ -94,33 +94,117 @@ const MOCK_PROPOSALS: CalendarEvent[] = [
   },
 ];
 
+// Fetch events from API
+async function fetchCalendarEvents(): Promise<CalendarEvent[]> {
+  try {
+    const response = await fetch("/api/calendar/events");
+    if (!response.ok) return [];
+    const data = await response.json();
+    return data.map((e: any) => ({
+      id: e.id,
+      title: e.title,
+      description: e.description || "",
+      startTime: e.start_time,
+      endTime: e.end_time,
+      location: e.location || "",
+      attendees: e.attendees ? JSON.parse(e.attendees) : [],
+      status: e.status || "confirmed",
+      source: e.source || "manual",
+      color: e.status === "pending"
+        ? "bg-orange-500/10 border-orange-500/30"
+        : e.status === "confirmed"
+        ? "bg-green-500/10 border-green-500/30"
+        : "bg-blue-500/10 border-blue-500/30",
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// Fetch proposals from API
+async function fetchCalendarProposals(): Promise<CalendarEvent[]> {
+  try {
+    const response = await fetch("/api/calendar/proposals");
+    if (!response.ok) return [];
+    const data = await response.json();
+    return data.map((e: any) => ({
+      id: e.id,
+      title: e.title,
+      description: e.description || "",
+      startTime: e.start_time,
+      endTime: e.end_time,
+      location: e.location || "",
+      attendees: e.attendees ? JSON.parse(e.attendees) : [],
+      status: "pending",
+      source: "email",
+      proposalSourceEmail: e.email || "",
+      color: "bg-orange-500/10 border-orange-500/30",
+    }));
+  } catch {
+    return [];
+  }
+}
+
 export default function CalendarPage() {
-  const [events, setEvents] = useState<CalendarEvent[]>(MOCK_EVENTS);
-  const [proposals, setProposals] = useState<CalendarEvent[]>(MOCK_PROPOSALS);
+  const [events, setEvents] = useState<CalendarEvent[]>([]);
+  const [proposals, setProposals] = useState<CalendarEvent[]>([]);
   const [viewMode, setViewMode] = useState<CalendarView>("list");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [currentMonth, setCurrentMonth] = useState(new Date());
 
-  const handleApprove = (proposalId: string) => {
-    setProposals((prev) =>
-      prev.map((p) =>
-        p.id === proposalId ? { ...p, status: "approved" as const } : p
-      )
-    );
+  // Load data on mount
+  useEffect(() => {
+    loadCalendarData();
+  }, []);
+
+  const loadCalendarData = async () => {
+    setLoading(true);
+    const [eventsData, proposalsData] = await Promise.all([
+      fetchCalendarEvents(),
+      fetchCalendarProposals(),
+    ]);
+    setEvents(eventsData);
+    setProposals(proposalsData);
+    setLoading(false);
   };
 
-  const handleReject = (proposalId: string) => {
-    setProposals((prev) =>
-      prev.map((p) =>
-        p.id === proposalId ? { ...p, status: "rejected" as const } : p
-      )
-    );
+  const handleApprove = async (proposalId: string) => {
+    try {
+      const response = await fetch(`/api/calendar/proposals/${proposalId}/approve`, {
+        method: "POST",
+      });
+      if (response.ok) {
+        setProposals((prev) =>
+          prev.map((p) =>
+            p.id === proposalId ? { ...p, status: "approved" as const } : p
+          )
+        );
+      }
+    } catch (error) {
+      console.error("Failed to approve proposal:", error);
+    }
+  };
+
+  const handleReject = async (proposalId: string) => {
+    try {
+      const response = await fetch(`/api/calendar/proposals/${proposalId}/reject`, {
+        method: "POST",
+      });
+      if (response.ok) {
+        setProposals((prev) =>
+          prev.map((p) =>
+            p.id === proposalId ? { ...p, status: "rejected" as const } : p
+          )
+        );
+      }
+    } catch (error) {
+      console.error("Failed to reject proposal:", error);
+    }
   };
 
   const handleRefresh = () => {
-    setLoading(true);
-    setTimeout(() => setLoading(false), 1000);
+    loadCalendarData();
   };
 
   const formatTime = (dateString: string) => {
@@ -194,108 +278,132 @@ export default function CalendarPage() {
     }
   };
 
-  const EventsList = () => (
-    <div className="space-y-4">
-      {events.map((event) => (
-        <div
-          key={event.id}
-          className={`glass-card rounded-2xl p-6 transition-all duration-200 hover:scale-[1.01] hover:shadow-lg ${event.color}`}
-        >
-          {/* Header */}
-          <div className="flex items-start justify-between mb-4">
-            <div className="flex items-center space-x-3">
-              {/* Source Icon */}
-              {getSourceIcon(event.source)}
-
-              <div>
-                <h3 className="font-semibold text-primary text-lg">
-                  {event.title}
-                </h3>
-                <div className="flex items-center space-x-2 mt-1">
-                  <span className="text-sm text-tertiary">
-                    {formatDate(event.startTime)}
-                  </span>
-                  <span className={`px-2 py-1 rounded-md text-xs font-medium flex items-center space-x-1 ${getStatusColor(
-                    event.status
-                  )}`}
-                  >
-                    {getStatusIcon(event.status)}
-                    <span className="uppercase">{event.status}</span>
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {/* Actions */}
-            <button className="p-2 rounded-lg bg-primary/10 hover:bg-primary/20 border border-primary/20 transition-all duration-200 cursor-pointer">
-              <MoreVertical className="w-5 h-5 text-primary" />
-            </button>
-          </div>
-
-          {/* Time & Location */}
-          <div className="flex items-start space-x-6 mb-4">
-            <div className="flex items-center space-x-2">
-              <Clock className="w-4 h-4 text-tertiary" />
-              <div>
-                <div className="text-sm text-tertiary">
-                  Start
-                </div>
-                <div className="font-medium text-primary">
-                  {formatTime(event.startTime)}
-                </div>
-              </div>
-            </div>
-            <div className="flex items-center space-x-2">
-              <Clock className="w-4 h-4 text-tertiary" />
-              <div>
-                <div className="text-sm text-tertiary">
-                  End
-                </div>
-                <div className="font-medium text-primary">
-                  {formatTime(event.endTime)}
-                </div>
-              </div>
-            </div>
-            <div className="flex items-center space-x-2">
-              <MapPin className="w-4 h-4 text-tertiary" />
-              <div className="text-sm font-medium text-primary">
-                {event.location}
-              </div>
-            </div>
-          </div>
-
-          {/* Description */}
-          {event.description && (
-            <p className="text-secondary mb-4">
-              {event.description}
-            </p>
-          )}
-
-          {/* Attendees */}
-          {event.attendees && event.attendees.length > 0 && (
-            <div className="border-t border-gray-200 pt-3">
-              <div className="flex items-center space-x-2 mb-2">
-                <Users className="w-4 h-4 text-tertiary" />
-                <span className="text-sm font-medium text-tertiary">
-                  Attendees ({event.attendees.length})
-                </span>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {event.attendees.map((attendee, idx) => (
-                  <span
-                    key={idx}
-                    className="px-3 py-1 rounded-md bg-primary/10 text-primary text-sm border border-primary/20"
-                  >
-                    {attendee}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
+  const EventsList = () => {
+    if (loading) {
+      return (
+        <div className="flex items-center justify-center py-12">
+          <RefreshCw className="w-8 h-8 text-primary animate-spin" />
         </div>
-      ))}
-    </div>
-  );
+      );
+    }
+
+    if (events.length === 0) {
+      return (
+        <div className="flex flex-col items-center justify-center py-12">
+          <Calendar className="w-16 h-16 text-tertiary mb-4" />
+          <h3 className="font-semibold text-primary text-lg mb-2">
+            No upcoming events
+          </h3>
+          <p className="text-secondary">
+            Your calendar is clear for the next few days
+          </p>
+        </div>
+      );
+    }
+
+    return (
+      <div className="space-y-4">
+        {events.map((event) => (
+          <div
+            key={event.id}
+            className={`glass-card rounded-2xl p-6 transition-all duration-200 hover:scale-[1.01] hover:shadow-lg ${event.color}`}
+          >
+            {/* Header */}
+            <div className="flex items-start justify-between mb-4">
+              <div className="flex items-center space-x-3">
+                {/* Source Icon */}
+                {getSourceIcon(event.source)}
+
+                <div>
+                  <h3 className="font-semibold text-primary text-lg">
+                    {event.title}
+                  </h3>
+                  <div className="flex items-center space-x-2 mt-1">
+                    <span className="text-sm text-tertiary">
+                      {formatDate(event.startTime)}
+                    </span>
+                    <span className={`px-2 py-1 rounded-md text-xs font-medium flex items-center space-x-1 ${getStatusColor(
+                      event.status
+                    )}`}
+                    >
+                      {getStatusIcon(event.status)}
+                      <span className="uppercase">{event.status}</span>
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Actions */}
+              <button className="p-2 rounded-lg bg-primary/10 hover:bg-primary/20 border border-primary/20 transition-all duration-200 cursor-pointer">
+                <MoreVertical className="w-5 h-5 text-primary" />
+              </button>
+            </div>
+
+            {/* Time & Location */}
+            <div className="flex items-start space-x-6 mb-4">
+              <div className="flex items-center space-x-2">
+                <Clock className="w-4 h-4 text-tertiary" />
+                <div>
+                  <div className="text-sm text-tertiary">
+                    Start
+                  </div>
+                  <div className="font-medium text-primary">
+                    {formatTime(event.startTime)}
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center space-x-2">
+                <Clock className="w-4 h-4 text-tertiary" />
+                <div>
+                  <div className="text-sm text-tertiary">
+                    End
+                  </div>
+                  <div className="font-medium text-primary">
+                    {formatTime(event.endTime)}
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center space-x-2">
+                <MapPin className="w-4 h-4 text-tertiary" />
+                <div className="text-sm font-medium text-primary">
+                  {event.location}
+                </div>
+              </div>
+            </div>
+
+            {/* Description */}
+            {event.description && (
+              <p className="text-secondary mb-4">
+                {event.description}
+              </p>
+            )}
+
+            {/* Attendees */}
+            {event.attendees && event.attendees.length > 0 && (
+              <div className="border-t border-gray-200 pt-3">
+                <div className="flex items-center space-x-2 mb-2">
+                  <Users className="w-4 h-4 text-tertiary" />
+                  <span className="text-sm font-medium text-tertiary">
+                    Attendees ({event.attendees.length})
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {event.attendees.map((attendee, idx) => (
+                    <span
+                      key={idx}
+                      className="px-3 py-1 rounded-md bg-primary/10 text-primary text-sm border border-primary/20"
+                    >
+                      {attendee}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    );
+  };
 
   const ProposalsSection = () => (
     <div className="space-y-4">

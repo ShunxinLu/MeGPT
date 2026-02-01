@@ -30,8 +30,16 @@ class OpenAIProvider(LLMProvider):
         "required": ["api_key", "base_url"],
         "properties": {
             "api_key": {"type": "string", "description": "API key"},
-            "base_url": {"type": "string", "description": "API base URL", "default": "https://api.openai.com/v1"},
-            "model": {"type": "string", "description": "Model name", "default": "gpt-4o"},
+            "base_url": {
+                "type": "string",
+                "description": "API base URL",
+                "default": "https://api.openai.com/v1",
+            },
+            "model": {
+                "type": "string",
+                "description": "Model name",
+                "default": "gpt-4o",
+            },
             "max_tokens": {"type": "integer", "default": 4096},
         },
     }
@@ -54,9 +62,22 @@ class OpenAIProvider(LLMProvider):
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
+
+    async def get_available_models(self) -> List[str]:
+        """Fetch available models from OpenAI API"""
+        client = self._get_client()
+        try:
+            response = await client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+            models = [m["id"] for m in data.get("data", [])]
+            return models if models else ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
+        except Exception as e:
+            logger.warning(f"Failed to fetch OpenAI models: {e}")
+            return ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
 
     async def chat_completion(
         self, messages: List[LLMMessage], options: ChatCompletionOptions
@@ -184,7 +205,7 @@ class AnthropicProvider(LLMProvider):
                     "anthropic-version": "2023-06-01",
                     "Content-Type": "application/json",
                 },
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
 
@@ -206,14 +227,18 @@ class AnthropicProvider(LLMProvider):
                 # Tool messages need special handling
                 if role == "tool":
                     # Convert tool response to user message with tool_result content
-                    converted.append({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": msg.tool_call_id,
-                            "content": msg.content,
-                        }],
-                    })
+                    converted.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": msg.tool_call_id,
+                                    "content": msg.content,
+                                }
+                            ],
+                        }
+                    )
                 else:
                     converted.append({"role": role, "content": msg.content})
 
@@ -255,14 +280,16 @@ class AnthropicProvider(LLMProvider):
                 if block["type"] == "text":
                     content += block["text"]
                 elif block["type"] == "tool_use":
-                    tool_calls.append({
-                        "id": block["id"],
-                        "type": "function",
-                        "function": {
-                            "name": block["name"],
-                            "arguments": json.dumps(block["input"]),
-                        },
-                    })
+                    tool_calls.append(
+                        {
+                            "id": block["id"],
+                            "type": "function",
+                            "function": {
+                                "name": block["name"],
+                                "arguments": json.dumps(block["input"]),
+                            },
+                        }
+                    )
 
         return LLMResponse(
             content=content,
@@ -319,12 +346,16 @@ class AnthropicProvider(LLMProvider):
     def get_default_model(self) -> str:
         return self.model
 
-    def get_available_models(self) -> List[str]:
+    async def get_available_models(self) -> List[str]:
+        """Fetch available models from Anthropic API"""
+        # Anthropic doesn't have a public /models endpoint
+        # Return current known models
         return [
+            "claude-sonnet-4-20250514",
+            "claude-3-7-sonnet-20250219",
             "claude-3-5-sonnet-20241022",
             "claude-3-5-haiku-20241022",
             "claude-3-opus-20240229",
-            "claude-3-sonnet-20240229",
         ]
 
 
@@ -354,7 +385,7 @@ class LMStudioProvider(LLMProvider):
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 headers={"Content-Type": "application/json"},
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
 
@@ -414,6 +445,25 @@ class LMStudioProvider(LLMProvider):
 
     def get_max_context_length(self) -> int:
         return 32768  # Typical for local models
+    
+    async def get_available_models(self) -> List[str]:
+        """Get list of available LM Studio models"""
+        client = self._get_client()
+        try:
+            # Handle both http://localhost:1234 and http://localhost:1234/v1
+            base = self.base_url.rstrip('/')
+            if not base.endswith('/v1'):
+                base = f"{base}/v1"
+            
+            response = await client.get(f"{base}/models")
+            response.raise_for_status()
+            data = response.json()
+            # LM Studio returns OpenAI-compatible format
+            models = [m["id"] for m in data.get("data", [])]
+            return models if models else [self.model]
+        except Exception:
+            # Fallback to configured model if API call fails
+            return [self.model]
 
 
 class OllamaProvider(LLMProvider):
@@ -442,7 +492,7 @@ class OllamaProvider(LLMProvider):
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 headers={"Content-Type": "application/json"},
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
 
@@ -533,7 +583,10 @@ class TogetherProvider(LLMProvider):
         "required": ["api_key"],
         "properties": {
             "api_key": {"type": "string"},
-            "model": {"type": "string", "default": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"},
+            "model": {
+                "type": "string",
+                "default": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+            },
         },
     }
 
@@ -551,7 +604,7 @@ class TogetherProvider(LLMProvider):
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
 
@@ -606,6 +659,20 @@ class TogetherProvider(LLMProvider):
                         yield StreamChunk(content=content, delta=content)
                     except json.JSONDecodeError:
                         continue
+
+    async def get_available_models(self) -> List[str]:
+        """Fetch available models from Together API"""
+        client = self._get_client()
+        try:
+            # Together uses OpenAI-compatible /models endpoint
+            response = await client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+            models = [m["id"] for m in data.get("data", [])]
+            return models if models else ["meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"]
+        except Exception as e:
+            logger.warning(f"Failed to fetch Together models: {e}")
+            return ["meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"]
 
 
 class GroqProvider(LLMProvider):
@@ -637,7 +704,7 @@ class GroqProvider(LLMProvider):
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
 
@@ -692,6 +759,20 @@ class GroqProvider(LLMProvider):
                         yield StreamChunk(content=content, delta=content)
                     except json.JSONDecodeError:
                         continue
+
+    async def get_available_models(self) -> List[str]:
+        """Fetch available models from Groq API"""
+        client = self._get_client()
+        try:
+            # Groq uses OpenAI-compatible /models endpoint
+            response = await client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+            models = [m["id"] for m in data.get("data", [])]
+            return models if models else ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile"]
+        except Exception as e:
+            logger.warning(f"Failed to fetch Groq models: {e}")
+            return ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile"]
 
 
 class DeepInfraProvider(LLMProvider):
@@ -723,7 +804,7 @@ class DeepInfraProvider(LLMProvider):
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
 
@@ -778,6 +859,20 @@ class DeepInfraProvider(LLMProvider):
                         yield StreamChunk(content=content, delta=content)
                     except json.JSONDecodeError:
                         continue
+
+    async def get_available_models(self) -> List[str]:
+        """Fetch available models from DeepInfra API"""
+        client = self._get_client()
+        try:
+            # DeepInfra uses OpenAI-compatible /models endpoint
+            response = await client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+            models = [m["id"] for m in data.get("data", [])]
+            return models if models else ["deepseek-ai/DeepSeek-V3"]
+        except Exception as e:
+            logger.warning(f"Failed to fetch DeepInfra models: {e}")
+            return ["deepseek-ai/DeepSeek-V3"]
 
 
 class DeepSeekDirectProvider(LLMProvider):
@@ -811,7 +906,7 @@ class DeepSeekDirectProvider(LLMProvider):
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
 
@@ -876,8 +971,19 @@ class DeepSeekDirectProvider(LLMProvider):
     def get_max_context_length(self) -> int:
         return 128000  # DeepSeek-V3 context
 
-    def get_available_models(self) -> List[str]:
-        return ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"]
+    async def get_available_models(self) -> List[str]:
+        """Fetch available models from DeepSeek API"""
+        client = self._get_client()
+        try:
+            # DeepSeek uses OpenAI-compatible /models endpoint
+            response = await client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+            models = [m["id"] for m in data.get("data", [])]
+            return models if models else ["deepseek-chat", "deepseek-coder"]
+        except Exception as e:
+            logger.warning(f"Failed to fetch DeepSeek models: {e}")
+            return ["deepseek-chat", "deepseek-coder"]
 
 
 class ZAIProvider(LLMProvider):
@@ -901,15 +1007,26 @@ class ZAIProvider(LLMProvider):
         self.model = config.get("model", "glm-4-flash")
         self._client: Optional[httpx.AsyncClient] = None
 
+        # Determine base URL based on model type
+        # GLM-4.7 (Coding Plan) uses a different endpoint
+        if self._is_coding_plan_model(self.model):
+            self.base_url = "https://api.z.ai/api/coding/paas/v4"
+        else:
+            self.base_url = "https://open.bigmodel.cn/api/paas/v4"
+
+    def _is_coding_plan_model(self, model: str) -> bool:
+        """Check if the model is a GLM-4.7 Coding Plan model."""
+        return model in ["glm-4.7", "glm-4.5-air"]
+
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
-                base_url="https://open.bigmodel.cn/api/paas/v4",
+                base_url=self.base_url,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
 
@@ -974,8 +1091,20 @@ class ZAIProvider(LLMProvider):
     def get_max_context_length(self) -> int:
         return 128000
 
-    def get_available_models(self) -> List[str]:
-        return ["glm-4-flash", "glm-4-plus", "glm-4-air", "glm-4"]
+    async def get_available_models(self) -> List[str]:
+        """Fetch available models from zhipu AI API"""
+        client = self._get_client()
+        try:
+            # zhipu AI uses OpenAI-compatible /models endpoint
+            response = await client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+            models = [m["id"] for m in data.get("data", [])]
+            return models if models else ["glm-4-flash", "glm-4-plus", "glm-4"]
+        except Exception as e:
+            logger.warning(f"Failed to fetch z.ai models: {e}")
+            # Return fallback list
+            return ["glm-4-flash", "glm-4-plus", "glm-4"]
 
 
 class XAIProvider(LLMProvider):
@@ -1007,7 +1136,7 @@ class XAIProvider(LLMProvider):
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
 
@@ -1077,8 +1206,19 @@ class XAIProvider(LLMProvider):
     def get_max_context_length(self) -> int:
         return 128000
 
-    def get_available_models(self) -> List[str]:
-        return ["grok-beta", "grok-vision-beta"]
+    async def get_available_models(self) -> List[str]:
+        """Fetch available models from xAI API"""
+        client = self._get_client()
+        try:
+            # xAI uses OpenAI-compatible /models endpoint
+            response = await client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+            models = [m["id"] for m in data.get("data", [])]
+            return models if models else ["grok-beta"]
+        except Exception as e:
+            logger.warning(f"Failed to fetch xAI models: {e}")
+            return ["grok-beta"]
 
 
 class OpenRouterProvider(LLMProvider):
@@ -1116,11 +1256,11 @@ class OpenRouterProvider(LLMProvider):
                 headers["HTTP-Referer"] = self.site_url
             if self.site_name:
                 headers["X-Title"] = self.site_name
-                
+
             self._client = httpx.AsyncClient(
                 base_url="https://openrouter.ai/api/v1",
                 headers=headers,
-                timeout=120.0,
+                timeout=120,
             )
         return self._client
 
@@ -1189,11 +1329,21 @@ class OpenRouterProvider(LLMProvider):
     def get_max_context_length(self) -> int:
         return 128000  # Varies by model
 
-    def get_available_models(self) -> List[str]:
-        # Typically one would fetch this from API, but for now hardcode populars
-        return [
-            "openai/gpt-4o",
-            "anthropic/claude-3.5-sonnet",
-            "meta-llama/llama-3.1-70b-instruct",
-            "google/gemini-pro-1.5",
-        ]
+    async def get_available_models(self) -> List[str]:
+        """Fetch available models from OpenRouter API"""
+        client = self._get_client()
+        try:
+            # OpenRouter has a /models endpoint
+            response = await client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+            models = [m["id"] for m in data.get("data", [])]
+            return models if models else ["openai/gpt-4o", "anthropic/claude-3.5-sonnet"]
+        except Exception as e:
+            logger.warning(f"Failed to fetch OpenRouter models: {e}")
+            return [
+                "openai/gpt-4o",
+                "anthropic/claude-3.5-sonnet",
+                "meta-llama/llama-3.1-70b-instruct",
+                "google/gemini-pro-1.5",
+            ]

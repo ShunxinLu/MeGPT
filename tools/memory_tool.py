@@ -7,6 +7,7 @@ Phase 4: Environment-aware collection names.
 import logging
 import uuid
 import time
+import threading
 from datetime import datetime
 from typing import Optional
 import httpx
@@ -22,12 +23,60 @@ from qdrant_client.http.models import (
 from langchain_core.tools import tool
 
 from config import config
+from utils.llm_factory import get_llm_config, get_embedding_config, get_llm_endpoint_url
+from database import get_connection
+from exceptions import (
+    MemoryServiceError,
+    MemoryConnectionError,
+    MemoryQueryError,
+    LLMError,
+    LLMServiceError,
+    LLMTimeoutError,
+    EmbeddingError,
+    wrap_exception,
+    is_retryable_error,
+)
 
 logger = logging.getLogger(__name__)
 
 # Constants - Phase 4: Use config for environment-aware collection
 DEFAULT_EMBEDDING_DIM = 768  # nomic-embed-text dimension
 _detected_embedding_dim = None
+
+# Embedding cache for performance optimization
+_embedding_cache = {}
+_embedding_cache_maxsize = 1000
+
+# HTTP client for connection pooling
+_http_client = None
+_http_client_lock = threading.Lock()
+
+
+def _normalize_base_url(base_url: str) -> str:
+    """
+    Normalize base URL by stripping trailing /v1 suffix.
+
+    ChatOpenAI and other clients add /v1 automatically, so we need to
+    remove it from the base URL to avoid duplication like:
+    http://localhost:1234/v1/v1/chat/completions
+    """
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    return base_url
+
+
+def _get_http_client() -> httpx.Client:
+    """Get or create shared HTTP client with connection pooling."""
+    global _http_client
+    with _http_client_lock:
+        if _http_client is None:
+            _http_client = httpx.Client(
+                timeout=30.0,
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=100),
+                transport=httpx.HTTPTransport(retries=1),
+            )
+    return _http_client
 
 
 def _get_embedding_dim() -> int:
@@ -48,7 +97,8 @@ def _get_embedding_dim() -> int:
             logger.info(f"Detected embedding dimension: {_detected_embedding_dim}")
             return _detected_embedding_dim
     except Exception as e:
-        logger.warning(f"Could not detect embedding dimension: {e}")
+        wrapped = wrap_exception(e, EmbeddingError, operation="dimension_detection")
+        logger.warning(f"Could not detect embedding dimension: {wrapped}")
 
     # Fall back to default
     logger.info(f"Using default embedding dimension: {DEFAULT_EMBEDDING_DIM}")
@@ -65,10 +115,14 @@ def _extract_facts(user_input: str, ai_response: str) -> str:
     Returns extracted facts or empty string if extraction fails.
     """
     try:
-        response = httpx.post(
-            f"{config.llm_base_url}/v1/chat/completions",
+        # Get current LLM config from database (not env vars)
+        llm_base_url, llm_api_key, llm_model = get_llm_config()
+
+        client = _get_http_client()
+        response = client.post(
+            get_llm_endpoint_url(),
             json={
-                "model": config.llm_model_name,
+                "model": llm_model,
                 "messages": [
                     {
                         "role": "user",
@@ -88,8 +142,8 @@ Instructions:
                 "max_tokens": 100,
                 "temperature": 0.2,
             },
-            headers={"Authorization": f"Bearer {config.llm_api_key}"},
-            timeout=30.0,
+            headers={"Authorization": f"Bearer {llm_api_key}"},
+            timeout=30,
         )
         response.raise_for_status()
         result = response.json()
@@ -99,14 +153,17 @@ Instructions:
             return fact
 
         return ""
-    except httpx.TimeoutException:
-        logger.error("Fact extraction timed out")
+    except httpx.TimeoutException as e:
+        wrapped = wrap_exception(e, LLMTimeoutError, operation="fact_extraction")
+        logger.error(f"Fact extraction timed out: {wrapped}")
         return ""
     except httpx.NetworkError as e:
-        logger.error(f"Network error during fact extraction: {e}")
+        wrapped = wrap_exception(e, LLMServiceError, operation="fact_extraction")
+        logger.error(f"Network error during fact extraction: {wrapped}")
         return ""
     except Exception as e:
-        logger.error(f"Unexpected error during fact extraction: {e}")
+        wrapped = wrap_exception(e, LLMError, operation="fact_extraction")
+        logger.error(f"Unexpected error during fact extraction: {wrapped}")
         return ""
 
 
@@ -115,7 +172,6 @@ def get_qdrant_client() -> Optional[QdrantClient]:
     Get or create the Qdrant client (singleton pattern) with health check.
     """
     global _qdrant_client, _qdrant_last_health_check
-    import time  # Import at top level to be available in all branches
 
     # If client exists, perform health check every 60 seconds
     if _qdrant_client is not None:
@@ -126,7 +182,12 @@ def get_qdrant_client() -> Optional[QdrantClient]:
                 _qdrant_client.get_collections()
                 _qdrant_last_health_check = current_time
             except Exception as e:
-                logger.warning(f"Qdrant client health check failed, recreating: {e}")
+                wrapped = wrap_exception(
+                    e, MemoryServiceError, operation="health_check"
+                )
+                logger.warning(
+                    f"Qdrant client health check failed, recreating: {wrapped}"
+                )
                 _qdrant_client = None
                 # Fall through to recreate
 
@@ -135,7 +196,7 @@ def get_qdrant_client() -> Optional[QdrantClient]:
             _qdrant_client = QdrantClient(
                 host=config.qdrant_host,
                 port=config.qdrant_port,
-                timeout=30.0,
+                timeout=30,
             )
             # Verify connection by getting collections
             _qdrant_client.get_collections()
@@ -144,10 +205,16 @@ def get_qdrant_client() -> Optional[QdrantClient]:
             _qdrant_last_health_check = time.time()
             logger.info("Qdrant memory store initialized")
         except httpx.ConnectError as e:
-            logger.error(f"Failed to connect to Qdrant: {e}")
+            wrapped = wrap_exception(
+                e, MemoryConnectionError, operation="client_initialization"
+            )
+            logger.error(f"Failed to connect to Qdrant: {wrapped}")
             _qdrant_client = None
         except Exception as e:
-            logger.error(f"Qdrant initialization failed: {e}")
+            wrapped = wrap_exception(
+                e, MemoryServiceError, operation="client_initialization"
+            )
+            logger.error(f"Qdrant initialization failed: {wrapped}")
             _qdrant_client = None
     return _qdrant_client
 
@@ -170,51 +237,97 @@ def _ensure_collection():
                     distance=Distance.COSINE,
                 ),
             )
-            logger.info(f"Created collection: {config.qdrant_collection} (dim: {_get_embedding_dim()})")
+            logger.info(
+                f"Created collection: {config.qdrant_collection} (dim: {_get_embedding_dim()})"
+            )
     except Exception as e:
-        logger.error(f"Collection check/create failed: {e}")
+        wrapped = wrap_exception(e, MemoryServiceError, operation="ensure_collection")
+        logger.error(f"Collection check/create failed: {wrapped}")
 
 
 def _get_embedding(text: str) -> Optional[list[float]]:
-    """Get embedding from local LM Studio embedding endpoint with retry."""
-    max_retries = 3
+    """Get embedding from configured embedding provider with retry and caching.
+
+    Uses database config if available, falls back to env vars.
+    """
+    # Get embedding config from database or env vars
+    embedder_base_url, embedder_api_key, embedder_model = get_embedding_config()
+
+    # Cache key includes text and model name to handle model changes
+    cache_key = (text, embedder_model)
+
+    # Check cache first
+    if cache_key in _embedding_cache:
+        logger.debug(f"Embedding cache hit for text: {text[:50]}...")
+        return _embedding_cache[cache_key]
+
+    logger.debug(f"Embedding cache miss for text: {text[:50]}...")
+
+    # Original implementation with retry logic
+    max_retries = 2
+    client = _get_http_client()
     for attempt in range(max_retries):
         try:
-            response = httpx.post(
-                f"{config.embedder_base_url}/v1/embeddings",
+            response = client.post(
+                f"{embedder_base_url}/embeddings",
                 json={
-                    "model": config.embedder_model_name,
+                    "model": embedder_model,
                     "input": text,
                 },
-                headers={"Authorization": f"Bearer {config.embedder_api_key}"},
-                timeout=30.0,
+                headers={"Authorization": f"Bearer {embedder_api_key}"},
+                timeout=30,
             )
             response.raise_for_status()
             data = response.json()
-            return data["data"][0]["embedding"]
-        except httpx.TimeoutException:
+            embedding = data["data"][0]["embedding"]
+
+            # Store in cache (only successful embeddings)
+            if len(_embedding_cache) >= _embedding_cache_maxsize:
+                # Remove oldest item (simple FIFO)
+                _embedding_cache.pop(next(iter(_embedding_cache)))
+            _embedding_cache[cache_key] = embedding
+
+            logger.debug(f"Embedding cached for text: {text[:50]}...")
+            return embedding
+
+        except httpx.TimeoutException as e:
+            wrapped = wrap_exception(e, LLMTimeoutError, operation="embedding")
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
-                logger.warning(f"Embedding timeout {attempt + 1}, retrying in {wait_time}s...")
+                logger.warning(
+                    f"Embedding timeout {attempt + 1}, retrying in {wait_time}s: {wrapped}"
+                )
                 time.sleep(wait_time)
             else:
-                logger.error(f"Embedding timed out after {max_retries} attempts")
+                logger.error(
+                    f"Embedding timed out after {max_retries} attempts: {wrapped}"
+                )
                 return None
         except httpx.NetworkError as e:
+            wrapped = wrap_exception(e, LLMServiceError, operation="embedding")
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 2
-                logger.warning(f"Embedding network error {attempt + 1}, retrying in {wait_time}s: {e}")
+                logger.warning(
+                    f"Embedding network error {attempt + 1}, retrying in {wait_time}s: {wrapped}"
+                )
                 time.sleep(wait_time)
             else:
-                logger.error(f"Embedding network error after {max_retries} attempts: {e}")
+                logger.error(
+                    f"Embedding network error after {max_retries} attempts: {wrapped}"
+                )
                 return None
         except Exception as e:
+            wrapped = wrap_exception(e, EmbeddingError, operation="embedding")
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 2
-                logger.warning(f"Embedding attempt {attempt + 1} failed, retrying in {wait_time}s: {e}")
+                logger.warning(
+                    f"Embedding attempt {attempt + 1} failed, retrying in {wait_time}s: {wrapped}"
+                )
                 time.sleep(wait_time)
             else:
-                logger.error(f"Embedding failed after {max_retries} attempts: {e}")
+                logger.error(
+                    f"Embedding failed after {max_retries} attempts: {wrapped}"
+                )
                 return None
     return None
 
@@ -248,7 +361,6 @@ def retrieve_context(query: str, user_id: str | None = None) -> str:
             return ""
 
         # Search in Qdrant using query_points (newer API)
-        from qdrant_client.http.models import QueryRequest
 
         results = client.query_points(
             collection_name=config.qdrant_collection,
@@ -256,7 +368,7 @@ def retrieve_context(query: str, user_id: str | None = None) -> str:
             query_filter=Filter(
                 must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
             ),
-            limit=10,  # Increased to include email facts
+            limit=config.context.fact_search_limit,
             with_payload=True,
         )
 
@@ -269,9 +381,12 @@ def retrieve_context(query: str, user_id: str | None = None) -> str:
         email_facts = []
 
         for hit in results.points:
-            if hit.score and hit.score > 0.4:  # Lowered threshold for more results
-                mem_type = hit.payload.get("type", "transcript")
-                memory = hit.payload.get('memory', '')
+            if hit.score and hit.score > config.context.fact_score_threshold:
+                payload = hit.payload
+                if payload is None:
+                    continue
+                mem_type = payload.get("type", "transcript")
+                memory = payload.get("memory", "")
 
                 if mem_type == "email_fact":
                     email_facts.append(memory)
@@ -290,13 +405,18 @@ def retrieve_context(query: str, user_id: str | None = None) -> str:
             parts.extend([f"- {fact}" for fact in email_facts])
 
         if parts:
-            logger.debug(f"Found {len(conversation_facts)} conversation facts, {len(email_facts)} email facts")
+            logger.debug(
+                f"Found {len(conversation_facts)} conversation facts, {len(email_facts)} email facts"
+            )
             return "\n".join(parts)
 
         logger.debug("No relevant memories found")
         return ""
     except Exception as e:
-        logger.error(f"Memory search failed: {e}")
+        wrapped = wrap_exception(
+            e, MemoryQueryError, operation="retrieve_context", user_id=user_id
+        )
+        logger.error(f"Memory search failed: {wrapped}")
         return ""
 
 
@@ -360,7 +480,14 @@ def save_interaction(
         logger.debug(f"Memory saved: {point_id}")
 
     except Exception as e:
-        logger.error(f"Memory save failed: {e}")
+        wrapped = wrap_exception(
+            e,
+            MemoryServiceError,
+            operation="save_interaction",
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        logger.error(f"Memory save failed: {wrapped}")
 
 
 def add_memory(fact: str, user_id: str | None = None) -> None:
@@ -397,7 +524,10 @@ def add_memory(fact: str, user_id: str | None = None) -> None:
         client.upsert(collection_name=config.qdrant_collection, points=[point])
         logger.debug(f"Added memory: {fact[:50]}...")
     except Exception as e:
-        logger.error(f"Memory add failed: {e}")
+        wrapped = wrap_exception(
+            e, MemoryServiceError, operation="add_memory", user_id=user_id
+        )
+        logger.error(f"Memory add failed: {wrapped}")
 
 
 def get_all_memories(user_id: str | None = None) -> list[dict]:
@@ -423,27 +553,33 @@ def get_all_memories(user_id: str | None = None) -> list[dict]:
             scroll_filter=Filter(
                 must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
             ),
-            limit=100,
+            limit=config.context.scroll_limit,
             with_payload=True,
         )
 
         memories = []
         for point in results:
+            payload = point.payload
+            if payload is None:
+                continue
             memories.append(
                 {
                     "id": str(point.id),
-                    "memory": point.payload.get("memory", ""),
-                    "created_at": point.payload.get("created_at"),
+                    "memory": payload.get("memory", ""),
+                    "created_at": payload.get("created_at"),
                     "metadata": {
-                        "chat_id": point.payload.get("chat_id"),
-                        "user_input": point.payload.get("user_input"),
+                        "chat_id": payload.get("chat_id"),
+                        "user_input": payload.get("user_input"),
                     },
                 }
             )
 
         return memories
     except Exception as e:
-        logger.error(f"Memory get_all failed: {e}")
+        wrapped = wrap_exception(
+            e, MemoryQueryError, operation="get_all_memories", user_id=user_id
+        )
+        logger.error(f"Memory get_all failed: {wrapped}")
         return []
 
 
@@ -469,7 +605,10 @@ def delete_memory(memory_id: str) -> bool:
         )
         return True
     except Exception as e:
-        logger.error(f"Memory delete failed: {e}")
+        wrapped = wrap_exception(
+            e, MemoryServiceError, operation="delete_memory", memory_id=memory_id
+        )
+        logger.error(f"Memory delete failed: {wrapped}")
         return False
 
 
@@ -500,7 +639,7 @@ def delete_memories_for_chat(chat_id: str, user_id: str | None = None) -> int:
                     FieldCondition(key="chat_id", match=MatchValue(value=chat_id)),
                 ]
             ),
-            limit=100,
+            limit=config.context.scroll_limit,
             with_payload=False,
         )
 
@@ -511,12 +650,19 @@ def delete_memories_for_chat(chat_id: str, user_id: str | None = None) -> int:
         point_ids = [str(point.id) for point in results]
         client.delete(
             collection_name=config.qdrant_collection,
-            points_selector=point_ids,
+            points_selector=point_ids,  # type: ignore
         )
 
         return len(point_ids)
     except Exception as e:
-        logger.error(f"Cascading memory delete failed: {e}")
+        wrapped = wrap_exception(
+            e,
+            MemoryServiceError,
+            operation="delete_memories_for_chat",
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        logger.error(f"Cascading memory delete failed: {wrapped}")
         return 0
 
 
@@ -538,20 +684,24 @@ def _extract_facts_from_email(email_data: dict) -> list[str]:
     try:
         # Build email context for fact extraction
         email_context = f"""
-Email Subject: {email_data.get('subject', '')}
-From: {email_data.get('sender', '')}
-Date: {email_data.get('date_received', '')}
+Email Subject: {email_data.get("subject", "")}
+From: {email_data.get("sender", "")}
+Date: {email_data.get("date_received", "")}
 
-{email_data.get('summary', '')}
+{email_data.get("summary", "")}
 
 Body (first 2000 chars):
-{email_data.get('body_markdown', '')[:2000]}
+{email_data.get("body_markdown", "")[:2000]}
 """
 
-        response = httpx.post(
-            f"{config.llm_base_url}/v1/chat/completions",
+        # Get current LLM config from database (not env vars)
+        llm_base_url, llm_api_key, llm_model = get_llm_config()
+
+        client = _get_http_client()
+        response = client.post(
+            get_llm_endpoint_url(),
             json={
-                "model": config.llm_model_name,
+                "model": llm_model,
                 "messages": [
                     {
                         "role": "user",
@@ -581,8 +731,8 @@ Examples:
                 "max_tokens": 500,
                 "temperature": 0.2,
             },
-            headers={"Authorization": f"Bearer {config.llm_api_key}"},
-            timeout=30.0,
+            headers={"Authorization": f"Bearer {llm_api_key}"},
+            timeout=30,
         )
         response.raise_for_status()
         result = response.json()
@@ -600,7 +750,8 @@ Examples:
         return facts
 
     except Exception as e:
-        logger.error(f"Email fact extraction failed: {e}")
+        wrapped = wrap_exception(e, LLMError, operation="email_fact_extraction")
+        logger.error(f"Email fact extraction failed: {wrapped}")
         return []
 
 
@@ -646,7 +797,9 @@ def ingest_email_to_memory(
         }
 
     try:
-        logger.debug(f"Ingesting email to memory: {email_data.get('subject', 'No subject')[:50]}...")
+        logger.debug(
+            f"Ingesting email to memory: {email_data.get('subject', 'No subject')[:50]}..."
+        )
 
         # Extract facts from email
         facts = _extract_facts_from_email(email_data)
@@ -839,7 +992,12 @@ def search_email_memories(query: str, user_id: str | None = None) -> list[dict]:
             return []
 
         # Search in Qdrant
-        from qdrant_client.http.models import QueryRequest, Filter, FieldCondition, MatchValue
+        from qdrant_client.http.models import (
+            QueryRequest,
+            Filter,
+            FieldCondition,
+            MatchValue,
+        )
 
         results = client.query_points(
             collection_name=config.qdrant_collection,
@@ -859,18 +1017,24 @@ def search_email_memories(query: str, user_id: str | None = None) -> list[dict]:
 
         # Format results
         memories = []
-        for hit in results:
-            if hit.score and hit.score > 0.4:  # Relevance threshold
-                memories.append({
+        for hit in results.points:
+            if not hit.score or hit.score <= config.context.email_fact_score_threshold:
+                continue
+            if hit.payload is None:
+                continue
+            payload = hit.payload
+            memories.append(
+                {
                     "id": str(hit.id),
-                    "memory": hit.payload.get("memory", ""),
+                    "memory": payload.get("memory", ""),
                     "score": hit.score,
                     "metadata": {
-                        "email_id": hit.payload.get("email_id"),
-                        "email_subject": hit.payload.get("email_subject"),
-                        "email_sender": hit.payload.get("email_sender"),
+                        "email_id": payload.get("email_id"),
+                        "email_subject": payload.get("email_subject"),
+                        "email_sender": payload.get("email_sender"),
                     },
-                })
+                }
+            )
 
         return memories
 
@@ -965,6 +1129,237 @@ def search_email_knowledge(query: str, limit: int = 5) -> str:
     return "\n".join(lines)
 
 
+# ========== Email Memory Functions ==========
+
+
+def save_email_facts(
+    email_id: str,
+    subject: str,
+    sender: str,
+    facts: list[str],
+    user_id: str | None = None,
+) -> int:
+    """
+    Save extracted facts from an email to Qdrant for semantic search.
+
+    Args:
+        email_id: The email ID
+        subject: Email subject
+        sender: Email sender
+        facts: List of fact strings extracted from email
+        user_id: Optional user identifier
+
+    Returns:
+        Number of facts saved
+    """
+    user_id = user_id or config.user_id
+    client = get_qdrant_client()
+
+    if client is None:
+        logger.warning("Memory client not available, skipping email facts save")
+        return 0
+
+    saved_count = 0
+
+    for fact in facts:
+        if not fact or len(fact.strip()) < 10:
+            continue
+
+        try:
+            # Create a rich context for the fact
+            fact_text = f"[Email from {sender}] {fact}"
+
+            embedding = _get_embedding(fact_text)
+            if embedding is None:
+                continue
+
+            point_id = str(uuid.uuid4())
+            point = PointStruct(
+                id=point_id,
+                vector=embedding,
+                payload={
+                    "user_id": user_id,
+                    "memory": fact_text,
+                    "type": "email_fact",
+                    "email_id": email_id,
+                    "email_subject": subject,
+                    "email_sender": sender,
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+            )
+
+            client.upsert(collection_name=config.qdrant_collection, points=[point])
+            saved_count += 1
+            logger.debug(f"Saved email fact: {fact[:50]}...")
+
+        except Exception as e:
+            logger.error(f"Failed to save email fact: {e}")
+
+    logger.info(f"Saved {saved_count} email facts from {email_id}")
+    return saved_count
+
+
+def search_email_facts(query: str, user_id: str | None = None, limit: int = 5) -> list[dict]:
+    """
+    Search for email-related facts using semantic search.
+
+    Args:
+        query: Search query
+        user_id: Optional user identifier
+        limit: Maximum results to return
+
+    Returns:
+        List of matching email facts with metadata
+    """
+    user_id = user_id or config.user_id
+    client = get_qdrant_client()
+
+    if client is None:
+        return []
+
+    try:
+        query_embedding = _get_embedding(query)
+        if query_embedding is None:
+            return []
+
+        # Search only email_fact types
+        results = client.search(
+            collection_name=config.qdrant_collection,
+            query_vector=query_embedding,
+            limit=limit,
+            query_filter=Filter(
+                must=[
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                    FieldCondition(key="type", match=MatchValue(value="email_fact")),
+                ]
+            ),
+            with_payload=True,
+        )
+
+        if not results or not results.points:
+            return []
+
+        formatted = []
+        for hit in results.points:
+            if hit.score and hit.score > config.context.email_fact_score_threshold:
+                payload = hit.payload or {}
+                formatted.append({
+                    "memory": payload.get("memory", ""),
+                    "email_id": payload.get("email_id"),
+                    "email_subject": payload.get("email_subject"),
+                    "email_sender": payload.get("email_sender"),
+                    "score": hit.score,
+                })
+
+        return formatted
+
+    except Exception as e:
+        logger.error(f"Email fact search failed: {e}")
+        return []
+
+
+def get_urgent_reminders(user_id: str | None = None, limit: int = 5) -> str:
+    """
+    Get urgent and overdue reminders for context injection.
+
+    Args:
+        user_id: Optional user identifier
+        limit: Maximum reminders to return
+
+    Returns:
+        Formatted string with urgent reminders
+    """
+    user_id = user_id or config.user_id
+
+    try:
+        with get_connection() as conn:
+            cursor = conn.execute("""
+                SELECT id, title, description, due_date, priority, status
+                FROM reminders
+                WHERE status IN ('pending', 'overdue')
+                  AND (due_date IS NULL OR due_date <= datetime('now', '+7 days'))
+                ORDER BY
+                    CASE priority
+                        WHEN 'critical' THEN 1
+                        WHEN 'important' THEN 2
+                        WHEN 'normal' THEN 3
+                        WHEN 'low' THEN 4
+                    END,
+                    due_date ASC
+                LIMIT ?
+            """, (limit,))
+
+            rows = cursor.fetchall()
+
+            if not rows:
+                return ""
+
+            lines = ["[URGENT REMINDERS]"]
+            for row in rows:
+                priority_icon = {
+                    "critical": "🔴",
+                    "important": "🟠",
+                    "normal": "🔵",
+                    "low": "🟢",
+                }.get(row["priority"], "🔵")
+
+                due_str = f" (due: {row['due_date']})" if row["due_date"] else ""
+                lines.append(f"{priority_icon} {row['title']}{due_str}")
+                if row["description"]:
+                    lines.append(f"   {row['description'][:100]}...")
+
+            return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Failed to get reminders: {e}")
+        return ""
+
+
+def get_unread_emails_summary(user_id: str | None = None, limit: int = 3) -> str:
+    """
+    Get summary of unread important emails for context injection.
+
+    Args:
+        user_id: Optional user identifier
+        limit: Maximum emails to return
+
+    Returns:
+        Formatted string with unread email summary
+    """
+    try:
+        with get_connection() as conn:
+            cursor = conn.execute("""
+                SELECT id, subject, sender, priority, date_received
+                FROM emails
+                WHERE is_read = 0
+                  AND is_spam_or_scam = 0
+                  AND priority IN ('critical', 'important')
+                ORDER BY
+                    CASE priority
+                        WHEN 'critical' THEN 1
+                        WHEN 'important' THEN 2
+                    END,
+                    date_received DESC
+                LIMIT ?
+            """, (limit,))
+
+            rows = cursor.fetchall()
+
+            if not rows:
+                return ""
+
+            lines = ["[UNREAD IMPORTANT EMAILS]"]
+            for row in rows:
+                priority_icon = "🔴" if row["priority"] == "critical" else "🟠"
+                lines.append(f"{priority_icon} {row['sender']}: {row['subject']}")
+
+            return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Failed to get unread emails: {e}")
+        return ""
+
+
 # Export tools for agent registration
 MEMORY_TOOLS = [
     ingest_emails,
@@ -1003,7 +1398,7 @@ def _chunk_text(text: str, chunk_size: int = 1500, overlap: int = 200) -> list[s
             for delimiter in [". ", "! ", "? ", "\n", "  "]:
                 last_delim = chunk.rfind(delimiter)
                 if last_delim > chunk_size // 2:  # At least half the chunk
-                    chunk = chunk[:last_delim + len(delimiter.strip())]
+                    chunk = chunk[: last_delim + len(delimiter.strip())]
                     break
 
         chunks.append(chunk.strip())
@@ -1024,10 +1419,14 @@ def _extract_facts_from_document(chunk: str, filename: str) -> list[str]:
         List of extracted facts
     """
     try:
-        response = httpx.post(
-            f"{config.llm_base_url}/v1/chat/completions",
+        # Get current LLM config from database (not env vars)
+        llm_base_url, llm_api_key, llm_model = get_llm_config()
+
+        client = _get_http_client()
+        response = client.post(
+            get_llm_endpoint_url(),
             json={
-                "model": config.llm_model_name,
+                "model": llm_model,
                 "messages": [
                     {
                         "role": "user",
@@ -1057,8 +1456,8 @@ Keep facts concise but complete.
                 "max_tokens": 500,
                 "temperature": 0.2,
             },
-            headers={"Authorization": f"Bearer {config.llm_api_key}"},
-            timeout=30.0,
+            headers={"Authorization": f"Bearer {llm_api_key}"},
+            timeout=30,
         )
         response.raise_for_status()
         result = response.json()
@@ -1140,7 +1539,7 @@ def ingest_document_to_memory(
 
             if not facts:
                 # Store chunk summary as fallback
-                fact_text = f"[Document: {filename}] Section {i+1}: {chunk[:200]}..."
+                fact_text = f"[Document: {filename}] Section {i + 1}: {chunk[:200]}..."
                 facts = [fact_text]
 
             # Store each fact in Qdrant
@@ -1168,16 +1567,21 @@ def ingest_document_to_memory(
                         payload=payload,
                     )
 
-                    client.upsert(collection_name=config.qdrant_collection, points=[point])
+                    client.upsert(
+                        collection_name=config.qdrant_collection, points=[point]
+                    )
                     all_facts.append(point_id)
 
                 except Exception as e:
                     logger.error(f"Failed to store document fact: {e}")
 
-        logger.debug(f"Document ingested: {chunk_count} chunks, {len(all_facts)} facts stored")
+        logger.debug(
+            f"Document ingested: {chunk_count} chunks, {len(all_facts)} facts stored"
+        )
 
         # Update document with chunk count
         from database import update_document
+
         update_document(document_id, chunk_count=chunk_count)
 
         return {
@@ -1197,7 +1601,9 @@ def ingest_document_to_memory(
         }
 
 
-def search_document_memories(query: str, user_id: str | None = None, limit: int = 10) -> list[dict]:
+def search_document_memories(
+    query: str, user_id: str | None = None, limit: int = 10
+) -> list[dict]:
     """
     Search the knowledge base for information from documents.
 
@@ -1220,7 +1626,12 @@ def search_document_memories(query: str, user_id: str | None = None, limit: int 
         if query_embedding is None:
             return []
 
-        from qdrant_client.http.models import QueryRequest, Filter, FieldCondition, MatchValue
+        from qdrant_client.http.models import (
+            QueryRequest,
+            Filter,
+            FieldCondition,
+            MatchValue,
+        )
 
         results = client.query_points(
             collection_name=config.qdrant_collection,
@@ -1239,18 +1650,24 @@ def search_document_memories(query: str, user_id: str | None = None, limit: int 
             return []
 
         memories = []
-        for hit in results:
-            if hit.score and hit.score > 0.35:  # Lower threshold for broader recall
-                memories.append({
+        for hit in results.points:
+            if not hit.score or hit.score <= config.context.document_fact_score_threshold:
+                continue
+            if hit.payload is None:
+                continue
+            payload = hit.payload
+            memories.append(
+                {
                     "id": str(hit.id),
-                    "memory": hit.payload.get("memory", ""),
+                    "memory": payload.get("memory", ""),
                     "score": hit.score,
                     "metadata": {
-                        "document_id": hit.payload.get("document_id"),
-                        "document_filename": hit.payload.get("document_filename"),
-                        "chunk_index": hit.payload.get("chunk_index"),
+                        "document_id": payload.get("document_id"),
+                        "document_filename": payload.get("document_filename"),
+                        "chunk_index": payload.get("chunk_index"),
                     },
-                })
+                }
+            )
 
         return memories
 
@@ -1282,10 +1699,12 @@ def delete_document_memories(document_id: str, user_id: str | None = None) -> in
             scroll_filter=Filter(
                 must=[
                     FieldCondition(key="user_id", match=MatchValue(value=user_id)),
-                    FieldCondition(key="document_id", match=MatchValue(value=document_id)),
+                    FieldCondition(
+                        key="document_id", match=MatchValue(value=document_id)
+                    ),
                 ]
             ),
-            limit=500,  # Documents can have many chunks
+            limit=config.context.document_scroll_limit,
             with_payload=False,
         )
 
@@ -1295,7 +1714,7 @@ def delete_document_memories(document_id: str, user_id: str | None = None) -> in
         point_ids = [str(point.id) for point in results]
         client.delete(
             collection_name=config.qdrant_collection,
-            points_selector=point_ids,
+            points_selector=point_ids,  # type: ignore
         )
 
         return len(point_ids)
