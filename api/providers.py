@@ -589,6 +589,18 @@ async def list_data_sources() -> Dict[str, Any]:
                 },
             },
         },
+        {
+            "id": "garmin",
+            "name": "Garmin Connect",
+            "description": "Sync health data from Garmin devices (steps, heart rate, sleep, workouts)",
+            "config_schema": {
+                "required": ["username", "password"],
+                "properties": {
+                    "username": {"type": "string", "description": "Garmin Connect username/email"},
+                    "password": {"type": "string", "description": "Garmin Connect password"},
+                },
+            },
+        },
     ]
 
     # Get configured data sources

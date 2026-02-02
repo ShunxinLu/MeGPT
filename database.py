@@ -343,6 +343,70 @@ def init_db():
             END
         """)
 
+        # Domain: Health tables for Garmin data
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS health_daily (
+                id TEXT PRIMARY KEY,
+                date TEXT NOT NULL UNIQUE,
+                steps INTEGER DEFAULT 0,
+                distance_meters REAL DEFAULT 0,
+                calories_total INTEGER DEFAULT 0,
+                calories_active INTEGER DEFAULT 0,
+                resting_heart_rate INTEGER DEFAULT 0,
+                avg_heart_rate INTEGER DEFAULT 0,
+                max_heart_rate INTEGER DEFAULT 0,
+                stress_avg INTEGER DEFAULT 0,
+                body_battery_high INTEGER DEFAULT 0,
+                body_battery_low INTEGER DEFAULT 0,
+                floors_climbed INTEGER DEFAULT 0,
+                intensity_minutes INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS health_sleep (
+                id TEXT PRIMARY KEY,
+                date TEXT NOT NULL UNIQUE,
+                sleep_start TEXT,
+                sleep_end TEXT,
+                duration_seconds INTEGER DEFAULT 0,
+                deep_sleep_seconds INTEGER DEFAULT 0,
+                light_sleep_seconds INTEGER DEFAULT 0,
+                rem_sleep_seconds INTEGER DEFAULT 0,
+                awake_seconds INTEGER DEFAULT 0,
+                sleep_score INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS health_activities (
+                id TEXT PRIMARY KEY,
+                garmin_activity_id TEXT UNIQUE,
+                activity_type TEXT,
+                name TEXT,
+                start_time TEXT,
+                duration_seconds INTEGER DEFAULT 0,
+                distance_meters REAL DEFAULT 0,
+                avg_heart_rate INTEGER DEFAULT 0,
+                max_heart_rate INTEGER DEFAULT 0,
+                calories INTEGER DEFAULT 0,
+                avg_pace TEXT,
+                summary TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS garmin_sync_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_sync_at DATETIME,
+                last_activity_sync_at DATETIME,
+                CONSTRAINT single_row CHECK (id = 1)
+            )
+        """)
+
         # Create indexes for performance
         _create_indexes(conn)
 
@@ -378,6 +442,13 @@ def _create_indexes(conn: sqlite3.Connection) -> None:
         ("idx_documents_status", "documents", "(status)"),
         ("idx_documents_type", "documents", "(file_type)"),
         ("idx_documents_created", "documents", "(created_at DESC)"),
+        # Health tables indexes
+        ("idx_health_daily_date", "health_daily", "(date)"),
+        ("idx_health_daily_steps", "health_daily", "(steps DESC)"),
+        ("idx_health_sleep_date", "health_sleep", "(date)"),
+        ("idx_health_sleep_score", "health_sleep", "(sleep_score)"),
+        ("idx_activities_start", "health_activities", "(start_time DESC)"),
+        ("idx_activities_type", "health_activities", "(activity_type)"),
     ]
 
     for idx_name, table, columns in indexes:
@@ -1070,6 +1141,155 @@ def search_documents(
             )
 
     return [dict(row) for row in cursor.fetchall()]
+
+
+# ========== Health Data CRUD ==========
+
+
+def store_health_daily(data: dict) -> bool:
+    """Store daily health metrics."""
+    import uuid
+    from datetime import date
+
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO health_daily
+            (id, date, steps, distance_meters, calories_total, calories_active,
+             resting_heart_rate, avg_heart_rate, max_heart_rate, stress_avg,
+             body_battery_high, body_battery_low, floors_climbed, intensity_minutes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(uuid.uuid4()),
+            data.get("date", date.today().isoformat()),
+            data.get("steps", 0),
+            data.get("distance_meters", 0),
+            data.get("calories_total", 0),
+            data.get("calories_active", 0),
+            data.get("resting_heart_rate", 0),
+            data.get("avg_heart_rate", 0),
+            data.get("max_heart_rate", 0),
+            data.get("stress_avg", 0),
+            data.get("body_battery_high", 0),
+            data.get("body_battery_low", 0),
+            data.get("floors_climbed", 0),
+            data.get("intensity_minutes", 0),
+        ))
+        return True
+
+
+def get_health_daily(date: str) -> dict | None:
+    """Get daily health metrics for a specific date."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM health_daily WHERE date = ?", (date,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def store_health_sleep(data: dict) -> bool:
+    """Store sleep data."""
+    import uuid
+
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO health_sleep
+            (id, date, sleep_start, sleep_end, duration_seconds,
+             deep_sleep_seconds, light_sleep_seconds, rem_sleep_seconds,
+             awake_seconds, sleep_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(uuid.uuid4()),
+            data.get("date", ""),
+            data.get("sleep_start", ""),
+            data.get("sleep_end", ""),
+            data.get("duration_seconds", 0),
+            data.get("deep_sleep_seconds", 0),
+            data.get("light_sleep_seconds", 0),
+            data.get("rem_sleep_seconds", 0),
+            data.get("awake_seconds", 0),
+            data.get("sleep_score", 0),
+        ))
+        return True
+
+
+def get_health_sleep(date: str) -> dict | None:
+    """Get sleep data for a specific date."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM health_sleep WHERE date = ?", (date,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def store_health_activity(data: dict) -> bool:
+    """Store activity/workout data."""
+    import uuid
+
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO health_activities
+            (id, garmin_activity_id, activity_type, name, start_time,
+             duration_seconds, distance_meters, avg_heart_rate, max_heart_rate,
+             calories, avg_pace)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(uuid.uuid4()),
+            data.get("garmin_activity_id", ""),
+            data.get("activity_type", ""),
+            data.get("name", ""),
+            data.get("start_time", ""),
+            data.get("duration_seconds", 0),
+            data.get("distance_meters", 0),
+            data.get("avg_heart_rate", 0),
+            data.get("max_heart_rate", 0),
+            data.get("calories", 0),
+            data.get("avg_pace", ""),
+        ))
+        return True
+
+
+def get_health_activities(limit: int = 10) -> list[dict]:
+    """Get recent health activities."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM health_activities ORDER BY start_time DESC LIMIT {limit}"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_garmin_sync_state(last_sync_at: str | None = None,
+                                  last_activity_sync_at: str | None = None) -> None:
+    """Update Garmin sync state."""
+    with get_connection() as conn:
+        # Ensure the single row exists
+        conn.execute("INSERT OR IGNORE INTO garmin_sync_state (id) VALUES (1)")
+
+        updates = []
+        params = []
+
+        if last_sync_at:
+            updates.append("last_sync_at = ?")
+            params.append(last_sync_at)
+        if last_activity_sync_at:
+            updates.append("last_activity_sync_at = ?")
+            params.append(last_activity_sync_at)
+
+        if updates:
+            conn.execute(
+                f"UPDATE garmin_sync_state SET {', '.join(updates)} WHERE id = 1",
+                params
+            )
+
+
+def get_garmin_sync_state() -> dict:
+    """Get Garmin sync state."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM garmin_sync_state WHERE id = 1").fetchone()
+        return dict(row) if row else {"id": 1, "last_sync_at": None, "last_activity_sync_at": None}
+
+
+# Initialize on import
+init_db()
 
 
 # Initialize on import

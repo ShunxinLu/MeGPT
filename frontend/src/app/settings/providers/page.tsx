@@ -12,6 +12,7 @@ import {
   Star,
   Database,
   Mail,
+  Heart,
 } from "lucide-react";
 import Link from "next/link";
 
@@ -81,6 +82,18 @@ export default function ProvidersPage() {
   const [emailClassificationModel, setEmailClassificationModel] = useState<string>("");
   const [loadingEmailConfig, setLoadingEmailConfig] = useState(false);
 
+  // Garmin/Health data sources state
+  const [dataSources, setDataSources] = useState<any[]>([]);
+  const [loadingDataSources, setLoadingDataSources] = useState(false);
+  const [showGarminModal, setShowGarminModal] = useState(false);
+  const [garminUsername, setGarminUsername] = useState("");
+  const [garminPassword, setGarminPassword] = useState("");
+  const [garminOtp, setGarminOtp] = useState("");
+  const [garminConnected, setGarminConnected] = useState(false);
+  // Two-step MFA state
+  const [garminAuthStep, setGarminAuthStep] = useState<"credentials" | "mfa">("credentials");
+  const [garminSessionId, setGarminSessionId] = useState<string | null>(null);
+
   // Modal state
   const [showConnectModal, setShowConnectModal] = useState<string | null>(null);
   const [apiKeyInput, setApiKeyInput] = useState("");
@@ -90,7 +103,91 @@ export default function ProvidersPage() {
     loadProviders();
     loadEmbeddingProviders();
     loadEmailClassificationConfig();
+    loadGarminStatus();
   }, []);
+
+  const loadGarminStatus = async () => {
+    try {
+      const res = await fetch("/api/garmin/status");
+      if (res.ok) {
+        const data = await res.json();
+        setGarminConnected(data.connected);
+      }
+    } catch (error) {
+      console.error("Failed to load Garmin status:", error);
+    }
+  };
+
+  const handleGarminConnect = async () => {
+    setSaving(true);
+    setMessage(null);
+    try {
+      // Step 1: Start login with credentials
+      if (garminAuthStep === "credentials") {
+        const res = await fetch("/api/garmin/auth/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: garminUsername,
+            password: garminPassword,
+          }),
+        });
+        const data = await res.json();
+
+        if (data.status === "authenticated") {
+          // Login complete without MFA
+          setMessage({ type: "success", text: "Garmin connected successfully!" });
+          setShowGarminModal(false);
+          resetGarminForm();
+          setGarminConnected(true);
+        } else if (data.status === "mfa_required") {
+          // Move to MFA step
+          setGarminSessionId(data.session_id);
+          setGarminAuthStep("mfa");
+        } else {
+          setMessage({ type: "error", text: data.detail || "Failed to connect Garmin" });
+        }
+      }
+      // Step 2: Submit MFA code
+      else if (garminAuthStep === "mfa") {
+        const res = await fetch("/api/garmin/auth/mfa", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: garminSessionId,
+            mfa_code: garminOtp,
+          }),
+        });
+        const data = await res.json();
+
+        if (data.status === "authenticated") {
+          setMessage({ type: "success", text: "Garmin connected successfully!" });
+          setShowGarminModal(false);
+          resetGarminForm();
+          setGarminConnected(true);
+        } else {
+          setMessage({ type: "error", text: data.detail || "MFA verification failed" });
+        }
+      }
+    } catch (error) {
+      setMessage({ type: "error", text: "Failed to connect Garmin" });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const resetGarminForm = () => {
+    setGarminUsername("");
+    setGarminPassword("");
+    setGarminOtp("");
+    setGarminAuthStep("credentials");
+    setGarminSessionId(null);
+  };
+
+  const openGarminModal = () => {
+    resetGarminForm();
+    setShowGarminModal(true);
+  };
 
   const loadProviders = async () => {
     try {
@@ -788,6 +885,165 @@ export default function ProvidersPage() {
                     <>
                       <Check className="w-5 h-5" />
                       Connect
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Garmin/Health Data Sources Section */}
+        <h2 className="text-lg font-semibold text-white mb-4 mt-10 flex items-center gap-2">
+          <Heart className="w-5 h-5 text-red-400" />
+          Health Data Sources
+        </h2>
+        <p className="text-zinc-500 text-sm mb-4 -mt-3">Connect health tracking services to view your fitness data</p>
+
+        <div className="p-6 rounded-2xl bg-gradient-to-br from-red-500/10 to-red-500/5 border border-red-500/20">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-4">
+              <div className={`w-3 h-3 rounded-full ${garminConnected ? "bg-green-500" : "bg-zinc-600"}`} />
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="font-semibold text-white">Garmin Connect</h3>
+                  {garminConnected && (
+                    <span className="px-2 py-0.5 text-xs bg-green-500/20 text-green-300 rounded-full flex items-center gap-1">
+                      <Check className="w-3 h-3" /> Connected
+                    </span>
+                  )}
+                </div>
+                <p className="text-sm text-zinc-500 mt-0.5">
+                  Sync steps, heart rate, sleep, and workouts from Garmin devices
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {garminConnected ? (
+                <button
+                  onClick={async () => {
+                    setSaving(true);
+                    try {
+                      await fetch("/api/garmin/auth", { method: "DELETE" });
+                      setGarminConnected(false);
+                      setMessage({ type: "success", text: "Garmin disconnected" });
+                      setTimeout(() => setMessage(null), 3000);
+                    } catch {
+                      setMessage({ type: "error", text: "Failed to disconnect" });
+                    } finally {
+                      setSaving(false);
+                    }
+                  }}
+                  disabled={saving}
+                  className="px-4 py-2 bg-white/5 text-zinc-300 hover:bg-white/10 rounded-lg transition-colors"
+                >
+                  Disconnect
+                </button>
+              ) : (
+                <button
+                  onClick={openGarminModal}
+                  className="px-4 py-2 bg-red-500/20 text-red-300 hover:bg-red-500/30 rounded-lg transition-colors flex items-center gap-2"
+                >
+                  <Plus className="w-4 h-4" />
+                  Connect
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Garmin Connect Modal */}
+        {showGarminModal && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+            <div className="bg-zinc-900 border border-white/10 rounded-2xl p-6 w-full max-w-md mx-4 shadow-2xl">
+              <h3 className="text-xl font-bold text-white mb-2">
+                {garminAuthStep === "mfa" ? "Enter Two-Factor Code" : "Connect Garmin Connect"}
+              </h3>
+              {garminAuthStep === "mfa" && (
+                <p className="text-sm text-zinc-400 mb-4">
+                  A code has been sent to your email. Enter it below to complete authentication.
+                </p>
+              )}
+
+              <div className="space-y-4">
+                {garminAuthStep === "credentials" ? (
+                  <>
+                    <div>
+                      <label className="block text-sm text-zinc-400 mb-2">Garmin Username / Email</label>
+                      <input
+                        type="text"
+                        value={garminUsername}
+                        onChange={(e) => setGarminUsername(e.target.value)}
+                        placeholder="your.email@example.com"
+                        className="w-full px-4 py-3 bg-black/40 border border-white/10 rounded-xl text-white placeholder-zinc-600 focus:outline-none focus:border-red-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm text-zinc-400 mb-2">Password</label>
+                      <input
+                        type="password"
+                        value={garminPassword}
+                        onChange={(e) => setGarminPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="w-full px-4 py-3 bg-black/40 border border-white/10 rounded-xl text-white placeholder-zinc-600 focus:outline-none focus:border-red-500/50"
+                      />
+                    </div>
+                    <p className="text-xs text-zinc-500">
+                      Credentials are stored securely in Windows Credential Manager.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <div>
+                      <label className="block text-sm text-zinc-400 mb-2">One-Time Passcode</label>
+                      <input
+                        type="text"
+                        value={garminOtp}
+                        onChange={(e) => setGarminOtp(e.target.value)}
+                        placeholder="123456"
+                        maxLength={6}
+                        autoFocus
+                        className="w-full px-4 py-3 bg-black/40 border border-white/10 rounded-xl text-white placeholder-zinc-600 focus:outline-none focus:border-red-500/50 text-center text-2xl tracking-widest"
+                      />
+                    </div>
+                    <p className="text-xs text-zinc-500">
+                      Check your email for the 6-digit code from Garmin.
+                    </p>
+                  </>
+                )}
+              </div>
+
+              <div className="flex gap-3 mt-6">
+                <button
+                  onClick={() => {
+                    setShowGarminModal(false);
+                    resetGarminForm();
+                  }}
+                  className="flex-1 px-4 py-3 bg-white/5 text-zinc-300 hover:bg-white/10 rounded-xl transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleGarminConnect}
+                  disabled={
+                    saving ||
+                    (garminAuthStep === "credentials" && (!garminUsername || !garminPassword)) ||
+                    (garminAuthStep === "mfa" && !garminOtp)
+                  }
+                  className="flex-1 px-4 py-3 bg-red-500 text-white hover:bg-red-600 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                >
+                  {saving ? (
+                    <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  ) : garminAuthStep === "mfa" ? (
+                    <>
+                      <Check className="w-5 h-5" />
+                      Verify
+                    </>
+                  ) : (
+                    <>
+                      <Check className="w-5 h-5" />
+                      Continue
                     </>
                   )}
                 </button>

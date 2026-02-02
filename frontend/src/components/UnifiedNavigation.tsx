@@ -5,8 +5,8 @@ import {
   MessageSquare,
   Mail,
   Calendar,
-  FileText,
-  Settings,
+  Activity,
+  Heart,
 } from "lucide-react";
 
 /**
@@ -19,7 +19,7 @@ type NavItem = {
   label: string;
   icon: React.ReactNode;
   href: string;
-  domain: "chat" | "email" | "calendar" | "documents" | "settings";
+  domain: "chat" | "email" | "calendar" | "health";
 };
 
 const NAV_ITEMS: NavItem[] = [
@@ -45,18 +45,11 @@ const NAV_ITEMS: NavItem[] = [
     domain: "calendar",
   },
   {
-    id: "documents",
-    label: "Knowledge",
-    icon: <FileText className="w-5 h-5" />,
-    href: "/documents",
-    domain: "documents",
-  },
-  {
-    id: "settings",
-    label: "Settings",
-    icon: <Settings className="w-5 h-5" />,
-    href: "/settings",
-    domain: "settings",
+    id: "health",
+    label: "Health",
+    icon: <Heart className="w-5 h-5" />,
+    href: "/health",
+    domain: "health",
   },
 ];
 
@@ -78,10 +71,8 @@ export default function UnifiedNavigation() {
         return "border-accent-primary";
       case "calendar":
         return "border-accent-tertiary";
-      case "documents":
-        return "border-violet-500";
-      case "settings":
-        return "border-border";
+      case "health":
+        return "border-red-500";
       default:
         return "border-transparent";
     }

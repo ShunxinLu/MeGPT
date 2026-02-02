@@ -858,6 +858,247 @@ async def trigger_sync_endpoint(
     }
 
 
+# ========== Domain Endpoints: Health ==========
+
+
+@app.get("/api/garmin/status")
+async def get_garmin_status():
+    """Check if Garmin is connected and authenticated."""
+    try:
+        from integrations.garmin_client import get_garmin_client
+
+        client = get_garmin_client()
+        return {"connected": client.is_authenticated}
+    except Exception as e:
+        logger.error(f"Failed to check Garmin status: {e}")
+        return {"connected": False}
+
+
+@app.post("/api/garmin/auth/start")
+async def start_garmin_auth(credentials: dict):
+    """Start Garmin authentication (step 1 - detects if MFA needed).
+
+    Request body:
+        - username: Garmin username/email
+        - password: Garmin password
+
+    Returns:
+        - success: True if authentication complete, False if MFA needed
+        - needs_mfa: True if MFA code required
+        - session_id: Session ID for submitting MFA code (if needs_mfa=True)
+        - error: Error message if login failed
+    """
+    try:
+        from integrations.garmin_client import get_garmin_client
+
+        client = get_garmin_client()
+        result = client.start_login(
+            username=credentials.get("username"),
+            password=credentials.get("password"),
+        )
+
+        if result.get("success"):
+            return {
+                "status": "authenticated",
+                "message": "Garmin connected successfully",
+                "needs_mfa": False,
+            }
+        elif result.get("needs_mfa"):
+            return {
+                "status": "mfa_required",
+                "message": "Please enter the one-time passcode sent to your email",
+                "needs_mfa": True,
+                "session_id": result.get("session_id"),
+            }
+        else:
+            error = result.get("error", "Authentication failed")
+            raise HTTPException(status_code=401, detail=error)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Garmin auth start error: {e}")
+        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
+
+
+@app.post("/api/garmin/auth/mfa")
+async def submit_garmin_mfa(mfa_data: dict):
+    """Submit MFA code to complete Garmin authentication (step 2).
+
+    Request body:
+        - session_id: Session ID from /api/garmin/auth/start
+        - mfa_code: One-time passcode from email
+
+    Returns:
+        - status: "authenticated" if successful
+        - error: Error message if failed
+    """
+    try:
+        from integrations.garmin_client import get_garmin_client
+
+        client = get_garmin_client()
+        result = client.submit_mfa_code(
+            session_id=mfa_data.get("session_id"),
+            mfa_code=mfa_data.get("mfa_code"),
+        )
+
+        if result.get("success"):
+            return {
+                "status": "authenticated",
+                "message": "Garmin connected successfully",
+            }
+        else:
+            error = result.get("error", "MFA verification failed")
+            raise HTTPException(status_code=401, detail=error)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Garmin MFA error: {e}")
+        raise HTTPException(status_code=500, detail=f"MFA verification error: {str(e)}")
+
+
+@app.post("/api/garmin/auth")
+async def authenticate_garmin(credentials: dict):
+    """Authenticate with Garmin Connect (legacy endpoint - redirects to new flow).
+
+    This endpoint is kept for backward compatibility.
+    For new implementations, use /api/garmin/auth/start + /api/garmin/auth/mfa
+    """
+    # If MFA code is provided, try direct submission
+    if credentials.get("session_id") and credentials.get("mfa_code"):
+        return await submit_garmin_mfa(credentials)
+
+    # Otherwise, start the auth flow
+    return await start_garmin_auth(credentials)
+
+
+@app.get("/api/garmin/health/daily")
+async def get_daily_health(date: str | None = None):
+    """Get daily health metrics for a specific date."""
+    try:
+        from database import get_health_daily
+
+        if not date:
+            from datetime import date as date_func
+            date = date_func.today().isoformat()
+
+        data = get_health_daily(date)
+        if data:
+            return data
+        else:
+            raise HTTPException(status_code=404, detail="No health data for this date")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get daily health: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/garmin/health/sleep")
+async def get_sleep(date: str | None = None):
+    """Get sleep data for a specific date."""
+    try:
+        from database import get_health_sleep
+
+        if not date:
+            from datetime import date as date_func
+            date = date_func.today().isoformat()
+
+        data = get_health_sleep(date)
+        if data:
+            return data
+        else:
+            raise HTTPException(status_code=404, detail="No sleep data for this date")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get sleep data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/garmin/activities")
+async def get_activities(limit: int = 10):
+    """Get recent workout activities."""
+    try:
+        from database import get_health_activities
+
+        activities = get_health_activities(limit)
+        return {"activities": activities}
+    except Exception as e:
+        logger.error(f"Failed to get activities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/garmin/sync")
+async def trigger_garmin_sync(background_tasks: BackgroundTasks):
+    """Trigger Garmin health data sync from background."""
+    async def run_garmin_sync():
+        """Sync Garmin data in background."""
+        try:
+            from integrations.garmin_client import get_garmin_client
+            from database import (
+                store_health_daily,
+                store_health_sleep,
+                store_health_activity,
+                update_garmin_sync_state,
+            )
+            from datetime import date, datetime
+
+            client = get_garmin_client()
+            if not client.ensure_authenticated():
+                logger.error("Garmin not authenticated, skipping sync")
+                return
+
+            # Sync today's stats
+            stats = client.get_todays_stats()
+            if stats:
+                store_health_daily(stats)
+
+            # Sync sleep data (last night)
+            sleep = client.get_sleep_data()
+            if sleep:
+                store_health_sleep(sleep)
+
+            # Sync recent activities
+            activities = client.get_activities(limit=20)
+            for activity in activities:
+                store_health_activity(activity)
+
+            # Update sync state
+            update_garmin_sync_state(
+                last_sync_at=datetime.now().isoformat(),
+                last_activity_sync_at=datetime.now().isoformat(),
+            )
+
+            logger.info("Garmin sync completed successfully")
+
+        except Exception as e:
+            logger.error(f"Garmin sync failed: {e}")
+
+    background_tasks.add_task(run_garmin_sync)
+
+    return {
+        "status": "sync_started",
+        "message": "Garmin data sync started in background",
+    }
+
+
+@app.delete("/api/garmin/auth")
+async def disconnect_garmin():
+    """Disconnect Garmin Connect and clear credentials."""
+    try:
+        from integrations.garmin_client import get_garmin_client
+
+        client = get_garmin_client()
+        client.disconnect()
+
+        return {"status": "disconnected", "message": "Garmin disconnected successfully"}
+    except Exception as e:
+        logger.error(f"Garmin disconnect error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to disconnect Garmin")
+
+
 # ========== Sync Functions ==========
 
 

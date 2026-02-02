@@ -91,6 +91,43 @@ class PrivacyGuard:
         pattern = r'\b(' + '|'.join(escaped) + r')\b'
         return re.compile(pattern, re.IGNORECASE)
 
+    def _convert_table_to_readable(self, table) -> str:
+        """
+        Convert HTML table to human-readable plain text.
+
+        Instead of markdown tables with pipes, we convert to:
+        - Key-value pairs for 2-column tables
+        - Bulleted lists for multi-column tables
+        """
+        rows = table.find_all("tr")
+        if not rows:
+            return ""
+
+        result = []
+
+        for row in rows:
+            cells = row.find_all(["td", "th"])
+            if not cells:
+                continue
+
+            cell_texts = [cell.get_text(strip=True) for cell in cells]
+
+            # For 2-column tables, use "key: value" format
+            if len(cell_texts) == 2 and cell_texts[0]:
+                result.append(f"{cell_texts[0]}: {cell_texts[1]}")
+            # For single column, just list it
+            elif len(cell_texts) == 1 and cell_texts[0]:
+                result.append(f"• {cell_texts[0]}")
+            # For wider tables, join with spaces or tabs
+            elif len(cell_texts) > 2:
+                # Use bullet for first non-empty cell, indent rest
+                first_cell = next((c for c in cell_texts if c), "")
+                if first_cell:
+                    other_cells = [c for c in cell_texts[1:] if c]
+                    result.append(f"• {first_cell} - {' | '.join(other_cells)}")
+
+        return "\n".join(result) if result else ""
+
     def html_to_markdown(self, html: str) -> str:
         """
         Convert HTML email content to clean Markdown.
@@ -133,7 +170,18 @@ class PrivacyGuard:
                     except (AttributeError, TypeError):
                         continue
 
-            # Convert to markdown
+            # Convert HTML tables to readable text BEFORE markdown conversion
+            for table in soup.find_all("table"):
+                readable_text = self._convert_table_to_readable(table)
+                if readable_text:
+                    # Replace table with a div containing the readable text
+                    new_tag = soup.new_tag("div")
+                    new_tag.string = "\n" + readable_text + "\n"
+                    table.replace_with(new_tag)
+                else:
+                    table.decompose()
+
+            # Convert to markdown (tables already handled)
             markdown = md(str(soup), heading_style="ATX", strip=["a"])
 
             if not markdown:

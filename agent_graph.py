@@ -46,6 +46,7 @@ from exceptions import (
 from tools.email_tools import EMAIL_TOOLS
 from tools.calendar_tools import CALENDAR_TOOLS
 from tools.vision_tools import VISION_TOOLS
+from tools.garmin_tools import HEALTH_TOOLS
 
 # Get logger (logging is configured in server.py)
 logger = logging.getLogger(__name__)
@@ -90,11 +91,20 @@ SYSTEM_PROMPT = """You are MeGPT, a helpful AI assistant with persistent long-te
    - `get_upcoming_events` - View upcoming calendar events
    - `create_event` - Create new calendar events
    - `update_event` / `delete_event` - Modify events
+5. **Health Tools**: You can access the user's REAL health data from Garmin:
+   - `get_health_summary` - Get daily health metrics (steps, HR, calories, stress, Body Battery)
+   - `get_recent_workouts` - View recent workout activities
+   - `get_sleep_data` - Get sleep analysis and quality
+   - `get_health_trends` - Analyze health patterns over time
+   - `get_upcoming_events` - View upcoming calendar events
+   - `create_event` - Create new calendar events
+   - `update_event` / `delete_event` - Modify events
 
 ## CRITICAL RULES:
 - **NEVER HALLUCINATE DATA**. If asked about emails, calendar, news, prices, etc., you MUST use the appropriate tool.
 - When user asks about "emails", "inbox", "messages" -> USE email tools (list_unread_emails, search_emails)
 - When user asks about "calendar", "schedule", "meetings" -> USE calendar tools (get_upcoming_events)
+- When user asks about "health", "fitness", "sleep", "steps", "workout" -> USE health tools (get_health_summary)
 - When user asks about current events, prices, news -> USE web_search
 - If a tool returns "no results", tell the user honestly - don't make up fake data
 
@@ -134,6 +144,7 @@ class AgentState(TypedDict, total=False):
 ALL_TOOLS = [
     *EMAIL_TOOLS,
     *CALENDAR_TOOLS,
+    *HEALTH_TOOLS,
     *VISION_TOOLS,
     *MEMORY_TOOLS,
     web_search,
